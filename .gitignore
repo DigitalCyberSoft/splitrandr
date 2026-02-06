@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# fakexrandr build artifacts
+fakexrandr/*.so
+fakexrandr/*.so.*
+fakexrandr/*.o
+fakexrandr/config.h
+fakexrandr/skeleton.h
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Config files (user-specific)
+*.bin
