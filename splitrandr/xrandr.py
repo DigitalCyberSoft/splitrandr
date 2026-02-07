@@ -141,6 +141,10 @@ class XRandR:
             'kill -STOP "$CINNAMON_PID"', 'kill -CONT "$CINNAMON_PID"',
             'if [ -n "$CINNAMON_PID" ]', 'sleep 0.', 'fi',
             '# Cinnamon safety',
+            # Readiness polling constructs (replacing blind sleeps)
+            'gsettings get', '_i=0', '_v=$(', 'done',
+            'xrandr --listmonitors >/dev/null',
+            '# Wait for gsettings', '# X server round-trip',
         ]
         removal_idxs = set(setmonitor_idxs + delmonitor_idxs)
         for i, line in enumerate(lines):
@@ -537,12 +541,18 @@ class XRandR:
                 'CINNAMON_PID=$(pgrep -x cinnamon 2>/dev/null)\n'
                 'if [ -n "$CINNAMON_PID" ]; then\n'
                 '  gsettings set org.cinnamon.settings-daemon.plugins.xrandr active false 2>/dev/null\n'
-                '  sleep 0.3\n'
+                '  # Wait for gsettings to propagate\n'
+                '  _i=0; while [ "$_i" -lt 20 ]; do\n'
+                '    _v=$(gsettings get org.cinnamon.settings-daemon.plugins.xrandr active 2>/dev/null)\n'
+                '    [ "$_v" = "false" ] && break\n'
+                '    sleep 0.05; _i=$((_i+1))\n'
+                '  done\n'
                 '  kill -STOP "$CINNAMON_PID" 2>/dev/null\n'
                 'fi\n'
                 + monitor_cmds + '\n'
                 'if [ -n "$CINNAMON_PID" ]; then\n'
-                '  sleep 0.2\n'
+                '  # X server round-trip to flush pending RandR events\n'
+                '  xrandr --listmonitors >/dev/null 2>&1\n'
                 '  kill -CONT "$CINNAMON_PID" 2>/dev/null\n'
                 'fi'
             )
@@ -642,9 +652,13 @@ class XRandR:
         try:
             from .fakexrandr_config import is_cinnamon_fakexrandr_loaded
             if is_cinnamon_fakexrandr_loaded():
-                import time
                 log.info("nudging Muffin to re-read fakexrandr config")
-                time.sleep(0.3)
+                # X server round-trip to flush pending events
+                try:
+                    self._output("--listmonitors")
+                except Exception:
+                    import time
+                    time.sleep(0.3)  # fallback
                 self._run(*self.configuration.commandlineargs())
         except Exception as e:
             log.warning("fakexrandr nudge failed: %s", e)
@@ -665,7 +679,6 @@ class XRandR:
                 restart_cinnamon_with_fakexrandr, restart_cinnamon_without_fakexrandr,
                 write_cinnamon_monitors_xml,
             )
-            import time
             has_splits = any(
                 not tree.is_leaf
                 for tree in self.configuration.splits.values()
@@ -686,9 +699,11 @@ class XRandR:
                     log.info("Cinnamon doesn't have fakexrandr loaded, restarting")
                     restart_cinnamon_with_fakexrandr(lib_path)
 
-                    # Wait for Cinnamon to start, then re-apply our config
+                    # Wait for Cinnamon to be ready on D-Bus
                     log.info("waiting for Cinnamon to settle")
-                    time.sleep(6)
+                    from .cinnamon_compat import _wait_cinnamon_on_dbus
+                    if not _wait_cinnamon_on_dbus(timeout=15.0):
+                        log.warning("Cinnamon did not respond on D-Bus within timeout, proceeding anyway")
                     log.info("re-applying xrandr config after Cinnamon restart")
                     self._run(*self.configuration.commandlineargs())
 

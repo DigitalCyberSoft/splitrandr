@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SplitRandR
+GenericName=Display Settings
+Comment=Monitor Layout Editor with Virtual Monitor Splitting
+Exec=splitrandr
+Icon=video-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=monitor;display;screen;split;xrandr;resolution;

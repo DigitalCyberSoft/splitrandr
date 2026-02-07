@@ -100,6 +100,71 @@ def _get_cinnamon_pid():
     return None
 
 
+def _poll_until(predicate, timeout, interval=0.1, description=""):
+    """Poll predicate() until it returns True or timeout expires.
+
+    Returns True if predicate succeeded, False on timeout.
+    """
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if predicate():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    if description:
+        log.warning("poll timed out after %.1fs: %s", timeout, description)
+    return False
+
+
+def _wait_cinnamon_on_dbus(timeout=15.0):
+    """Wait for Cinnamon's JS engine to be ready on D-Bus.
+
+    Polls org.Cinnamon.Eval to check that the JS engine is up.
+    Falls back to org.freedesktop.DBus.Peer.Ping.
+    Returns True if Cinnamon responded, False on timeout.
+    """
+    log.info("waiting for Cinnamon D-Bus readiness (timeout=%.0fs)", timeout)
+
+    def _cinnamon_eval_ready():
+        result = subprocess.run(
+            ['gdbus', 'call', '--session',
+             '--dest', 'org.Cinnamon',
+             '--object-path', '/org/Cinnamon',
+             '--method', 'org.Cinnamon.Eval',
+             'global.display.get_n_monitors()'],
+            capture_output=True, text=True, timeout=3
+        )
+        return result.returncode == 0
+
+    if _poll_until(_cinnamon_eval_ready, timeout, interval=0.25,
+                   description="Cinnamon D-Bus Eval readiness"):
+        log.info("Cinnamon is ready on D-Bus")
+        return True
+
+    # Fallback: try a simpler Ping
+    log.info("Eval failed, trying D-Bus Peer.Ping fallback")
+
+    def _cinnamon_ping_ready():
+        result = subprocess.run(
+            ['gdbus', 'call', '--session',
+             '--dest', 'org.Cinnamon',
+             '--object-path', '/org/Cinnamon',
+             '--method', 'org.freedesktop.DBus.Peer.Ping'],
+            capture_output=True, text=True, timeout=3
+        )
+        return result.returncode == 0
+
+    if _poll_until(_cinnamon_ping_ready, 3.0, interval=0.25,
+                   description="Cinnamon D-Bus Ping"):
+        log.info("Cinnamon responded to Ping (Eval may still be initializing)")
+        return True
+
+    return False
+
+
 def is_setmonitor_affected():
     """Check if the current system is affected by the --setmonitor crash.
 
@@ -170,7 +235,17 @@ class CinnamonSetMonitorGuard:
                      'org.cinnamon.settings-daemon.plugins.xrandr', 'active', 'false'],
                     capture_output=True, timeout=5
                 )
-                time.sleep(0.3)
+                # Wait for gsettings to propagate
+                def _gsettings_is_false():
+                    r = subprocess.run(
+                        ['gsettings', 'get',
+                         'org.cinnamon.settings-daemon.plugins.xrandr', 'active'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    return r.stdout.strip() == 'false'
+                if not _poll_until(_gsettings_is_false, timeout=1.0, interval=0.05,
+                                   description="gsettings propagation"):
+                    time.sleep(0.3)  # fallback
             except Exception as e:
                 log.warning("failed to disable csd-xrandr: %s", e)
 
@@ -192,7 +267,14 @@ class CinnamonSetMonitorGuard:
 
         # Step 3: Resume Cinnamon
         if self._frozen and self._cinnamon_pid:
-            time.sleep(0.2)  # Let X server settle
+            # X server round-trip to flush pending RandR events
+            try:
+                subprocess.run(
+                    ['xrandr', '--listmonitors'],
+                    capture_output=True, timeout=5
+                )
+            except Exception:
+                time.sleep(0.2)  # fallback
             log.info("resuming Cinnamon (PID %d)", self._cinnamon_pid)
             try:
                 os.kill(self._cinnamon_pid, signal.SIGCONT)

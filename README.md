@@ -4,6 +4,10 @@ A GTK3 display layout editor for X11 that lets you split a single physical monit
 
 SplitRandR is focused on **Linux Mint / Cinnamon** desktops, where the Muffin window manager ignores RandR 1.5 virtual monitors. It bundles a vendored fork of [fakexrandr](https://github.com/niclas/fakexrandr) to work around this by intercepting libXrandr calls at the LD_PRELOAD level.
 
+![SplitRandR main interface](screenshots/splitrandr-main.png)
+
+![Split monitors in Cinnamon display settings](screenshots/cinnamon-split-monitors.png)
+
 **This is experimental software.** It is unlikely to work on your system without some tweaking. It was developed against a specific hardware setup (Samsung Odyssey Ark + Acer HDMI monitor on Cinnamon 6.x / Fedora) and the workarounds are tailored to that environment.
 
 ## What it does
