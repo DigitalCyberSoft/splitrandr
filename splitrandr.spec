@@ -12,6 +12,7 @@ Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  gcc
 BuildRequires:  python3-devel
 BuildRequires:  pkgconfig(xrandr)
+BuildRequires:  pkgconfig(xinerama)
 BuildRequires:  pkgconfig(x11)
 BuildRequires:  desktop-file-utils
 BuildRequires:  pkgconfig
