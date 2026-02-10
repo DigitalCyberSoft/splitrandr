@@ -609,8 +609,31 @@ class Application:
         if response != Gtk.ResponseType.ACCEPT:
             log.info("REVERTING: running revert script")
             log.info("revert script:\n%s", revert_script)
-            subprocess.Popen(['sh', '-c', revert_script])
+            # Clear fakexrandr config so xrandr sees real physical outputs
+            try:
+                from .fakexrandr_config import CONFIG_PATH
+                if os.path.exists(CONFIG_PATH):
+                    os.remove(CONFIG_PATH)
+            except Exception:
+                pass
+            subprocess.run(['sh', '-c', revert_script], timeout=30)
             self.widget.load_from_x()
+            # Restore fakexrandr config if splits are active
+            try:
+                xrandr = self.widget._xrandr
+                splits = xrandr.configuration.splits
+                if any(not t.is_leaf for t in splits.values()):
+                    from .fakexrandr_config import (
+                        write_fakexrandr_config, write_cinnamon_monitors_xml,
+                    )
+                    write_fakexrandr_config(
+                        splits, xrandr.state, xrandr.configuration
+                    )
+                    write_cinnamon_monitors_xml(
+                        splits, xrandr.state, xrandr.configuration
+                    )
+            except Exception:
+                pass
             return False
         log.info("KEEPING changes")
         return True
@@ -660,7 +683,8 @@ class Application:
 
         active = profiles.get_active_profile()
         if active:
-            script = "\n".join(self.filetemplate)
+            script = self.widget._xrandr.save_to_shellscript_string(
+                self.filetemplate)
             profiles.save_profile(active, script)
 
         autostart_dir = os.path.dirname(self.AUTOSTART_DESKTOP)
@@ -791,7 +815,8 @@ class Application:
         if dialog.run() == Gtk.ResponseType.ACCEPT:
             name = entry.get_text().strip()
             if name:
-                script = "\n".join(self.filetemplate)
+                script = self.widget._xrandr.save_to_shellscript_string(
+                    self.filetemplate)
                 profiles.save_profile(name, script)
                 profiles.set_active_profile(name)
                 self._populate_profiles_combo()

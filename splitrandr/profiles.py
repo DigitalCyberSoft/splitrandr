@@ -101,3 +101,21 @@ def apply_profile(name):
     if os.path.exists(path):
         subprocess.run(['sh', path])
         set_active_profile(name)
+
+        # Update fakexrandr config and monitors.xml from current X state
+        try:
+            from .xrandr import XRandR
+            xrandr = XRandR(force_version=True)
+            xrandr.load_from_x()
+
+            from .fakexrandr_config import (
+                write_fakexrandr_config, write_cinnamon_monitors_xml,
+            )
+            write_fakexrandr_config(
+                xrandr.configuration.splits, xrandr.state, xrandr.configuration
+            )
+            write_cinnamon_monitors_xml(
+                xrandr.configuration.splits, xrandr.state, xrandr.configuration
+            )
+        except Exception:
+            pass

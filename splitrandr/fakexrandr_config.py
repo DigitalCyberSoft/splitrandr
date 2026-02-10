@@ -214,7 +214,7 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config):
 
             regions = list(tree.leaf_regions(w, h, 0, 0, w_mm, h_mm))
             for i, (rx, ry, rw, rh, rmm_w, rmm_h) in enumerate(regions):
-                connector = "%s~%d" % (output_name, i + 1)  # 1-indexed
+                connector = "%s~%d" % (output_name, i)  # 0-indexed, matches setmonitor
                 _add_logicalmonitor(
                     split_config, connector,
                     "unknown", "unknown", "unknown",

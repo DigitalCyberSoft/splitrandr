@@ -358,62 +358,194 @@ class XRandR:
                 active, primary, geometry, current_rotation, currentname, current_rate
             )
 
-        # Load existing virtual monitors from X
+        # Load existing virtual monitors from X and merge virtual outputs
+        # (DP-5~0, ~1, ~2) back into their physical parent (DP-5).
         self._load_monitors()
 
     def _load_monitors(self):
-        """Parse xrandr --listmonitors and reconstruct splits for existing virtual monitors."""
+        """Reconstruct splits and merge virtual outputs into physical outputs.
+
+        When fakexrandr is active, xrandr --verbose only reports virtual
+        outputs (DP-5~1, ~2, ~3) — the physical DP-5 disappears.  We use
+        --listmonitors for the physical geometry and the already-loaded
+        virtual outputs (from --verbose) for the split regions.
+        """
+        # ── 1. Parse --listmonitors for physical and virtual geometry ──
+        physical_geom = {}  # name -> (w, h, x, y, w_mm, h_mm)
+        vm_regions = {}     # base_name -> [(x, y, w, h), ...]
         try:
-            output = self._output("--listmonitors")
+            listmon = self._output("--listmonitors")
+            for line in listmon.strip().split('\n'):
+                line = line.strip()
+                if line.startswith('Monitors:'):
+                    continue
+                m = re.match(
+                    r'\d+:\s+[+*]*(\S+)\s+(\d+)/(\d+)x(\d+)/(\d+)\+(\d+)\+(\d+)',
+                    line
+                )
+                if not m:
+                    continue
+                mon_name = m.group(1)
+                w, w_mm, h, h_mm, x, y = [int(m.group(i)) for i in range(2, 8)]
+                if '~' not in mon_name:
+                    physical_geom[mon_name] = (w, h, x, y, w_mm, h_mm)
+                else:
+                    base = mon_name.rsplit('~', 1)[0]
+                    try:
+                        int(mon_name.rsplit('~', 1)[1])
+                    except ValueError:
+                        continue
+                    if base not in vm_regions:
+                        vm_regions[base] = []
+                    vm_regions[base].append((x, y, w, h))
         except Exception:
-            return
+            pass
 
-        # Parse lines like:
-        #  0: +*DP-5 3840/1210x2160/680+0+0  DP-5
-        #  1: +DP-5~0 1920/605x2160/680+0+0  DP-5
-        monitors_by_output = {}
-        for line in output.strip().split('\n'):
-            line = line.strip()
-            if line.startswith('Monitors:'):
+        # ── 2. Group virtual outputs by base name ────────────────────
+        # Use the outputs already loaded from --verbose, which has ALL
+        # virtual outputs (--listmonitors can be missing some).
+        virt_groups = {}  # base_name -> [virt_name, ...]
+        for name in list(self.configuration.outputs.keys()):
+            if '~' not in name:
                 continue
-            m = re.match(
-                r'\d+:\s+[+*]*(\S+)\s+(\d+)/(\d+)x(\d+)/(\d+)\+(\d+)\+(\d+)(?:\s+(\S+))?',
-                line
-            )
-            if not m:
-                continue
-            mon_name = m.group(1)
-            w, w_mm, h, h_mm, x, y = [int(m.group(i)) for i in range(2, 8)]
-            real_output = m.group(8) or ""
-
-            # Only look at virtual monitors matching OUTPUT~N pattern
-            if '~' not in mon_name:
-                continue
-            base_output = mon_name.rsplit('~', 1)[0]
+            base = name.rsplit('~', 1)[0]
             try:
-                idx = int(mon_name.rsplit('~', 1)[1])
+                int(name.rsplit('~', 1)[1])
             except ValueError:
                 continue
+            if base not in virt_groups:
+                virt_groups[base] = []
+            virt_groups[base].append(name)
 
-            if base_output not in monitors_by_output:
-                monitors_by_output[base_output] = []
-            monitors_by_output[base_output].append((x, y, w, h))
+        # ── 3. For each group, reconstruct splits ────────────────────
+        for base_name, virt_names in virt_groups.items():
 
-        for output_name, regions in monitors_by_output.items():
-            if output_name not in self.configuration.outputs:
+            # Case A: physical output already exists (fakexrandr not
+            # intercepting xrandr, so DP-5 shows up alongside DP-5~N).
+            if base_name in self.configuration.outputs:
+                output_cfg = self.configuration.outputs[base_name]
+                if not output_cfg.active:
+                    continue
+                ox, oy = output_cfg.position
+                total_w, total_h = output_cfg.size[0], output_cfg.size[1]
+                regions = []
+                for vn in virt_names:
+                    vc = self.configuration.outputs[vn]
+                    if vc.active:
+                        regions.append((vc.position[0], vc.position[1],
+                                        vc.size[0], vc.size[1]))
+                normalized = [(r[0] - ox, r[1] - oy, r[2], r[3])
+                              for r in regions]
+                tree = SplitTree.from_setmonitor_regions(
+                    normalized, base_name, total_w, total_h)
+                if not tree.is_leaf:
+                    self.configuration.splits[base_name] = tree
+                # Remove virtual outputs — splits are in the overlay
+                for vn in virt_names:
+                    self.configuration.outputs.pop(vn, None)
+                    self.state.outputs.pop(vn, None)
                 continue
-            output_cfg = self.configuration.outputs[output_name]
+
+            # Case B: physical output missing (fakexrandr active).
+            # Collect regions from the virtual outputs' geometry.
+            regions = []
+            first_virt = virt_names[0]
+            for vn in virt_names:
+                vc = self.configuration.outputs.get(vn)
+                if vc and vc.active:
+                    regions.append((vc.position[0], vc.position[1],
+                                    vc.size[0], vc.size[1]))
+            if not regions:
+                continue
+
+            # Physical geometry from --listmonitors, or bounding box
+            if base_name in physical_geom:
+                pw, ph, px, py, pw_mm, ph_mm = physical_geom[base_name]
+            else:
+                px = min(r[0] for r in regions)
+                py = min(r[1] for r in regions)
+                pw = max(r[0] + r[2] for r in regions) - px
+                ph = max(r[1] + r[3] for r in regions) - py
+                pw_mm = ph_mm = 0
+
+            # Find the physical mode from the virtual output's mode list
+            virt_state = self.state.outputs[first_virt]
+            virt_cfg = self.configuration.outputs[first_virt]
+            phys_mode = None
+            for mode in virt_state.modes:
+                if mode.width == pw and mode.height == ph:
+                    phys_mode = mode
+                    break
+            if phys_mode is None:
+                mode_name = "%dx%d" % (pw, ph)
+                phys_mode = NamedSize(Size([pw, ph]), name=mode_name,
+                                      refresh_rate=60.0)
+
+            # Build physical output state
+            phys_state = self.State.Output(base_name)
+            phys_state.connected = True
+            phys_state.modes = list(virt_state.modes)
+            # Ensure the physical resolution is available as a mode
+            if not any(m.name == phys_mode.name for m in phys_state.modes):
+                phys_state.modes.append(phys_mode)
+            phys_state.rotations = virt_state.rotations
+            phys_state.edid_hex = virt_state.edid_hex
+            phys_state.physical_w_mm = pw_mm
+            phys_state.physical_h_mm = ph_mm
+
+            # Build physical output configuration
+            phys_rotation = virt_cfg.rotation if virt_cfg.rotation else NORMAL
+            any_primary = any(
+                self.configuration.outputs[vn].primary
+                for vn in virt_names
+                if self.configuration.outputs.get(vn)
+                and self.configuration.outputs[vn].active
+            )
+            phys_cfg_obj = self.Configuration.OutputConfiguration(
+                active=True, primary=any_primary,
+                geometry=Geometry(pw, ph, px, py),
+                rotation=phys_rotation,
+                modename=phys_mode.name,
+                refresh_rate=phys_mode.refresh_rate,
+            )
+
+            # Insert physical, remove virtual outputs
+            self.state.outputs[base_name] = phys_state
+            self.configuration.outputs[base_name] = phys_cfg_obj
+            for vn in virt_names:
+                self.configuration.outputs.pop(vn, None)
+                self.state.outputs.pop(vn, None)
+
+            # Reconstruct split tree from virtual output regions
+            normalized = [(r[0] - px, r[1] - py, r[2], r[3])
+                          for r in regions]
+            tree = SplitTree.from_setmonitor_regions(
+                normalized, base_name, pw, ph)
+            if not tree.is_leaf:
+                self.configuration.splits[base_name] = tree
+
+        # ── 4. Case C: setmonitor virtual monitors (no fakexrandr) ──
+        # If --listmonitors shows ~-named virtual monitors but they
+        # weren't in --verbose outputs (fakexrandr not active),
+        # reconstruct splits from the listmonitors regions.
+        for base_name, regions in vm_regions.items():
+            if base_name in virt_groups:
+                continue  # already handled in step 3
+            if base_name not in self.configuration.outputs:
+                continue
+            if base_name in self.configuration.splits:
+                continue  # already has splits
+            output_cfg = self.configuration.outputs[base_name]
             if not output_cfg.active:
                 continue
-
-            total_w = output_cfg.size[0]
-            total_h = output_cfg.size[1]
             ox, oy = output_cfg.position
-            normalized = [(r[0] - ox, r[1] - oy, r[2], r[3]) for r in regions]
-
-            tree = SplitTree.from_setmonitor_regions(normalized, output_name, total_w, total_h)
+            total_w, total_h = output_cfg.size[0], output_cfg.size[1]
+            normalized = [(r[0] - ox, r[1] - oy, r[2], r[3])
+                          for r in regions]
+            tree = SplitTree.from_setmonitor_regions(
+                normalized, base_name, total_w, total_h)
             if not tree.is_leaf:
-                self.configuration.splits[output_name] = tree
+                self.configuration.splits[base_name] = tree
 
     def _load_raw_lines(self):
         output = self._output("--verbose")
@@ -589,6 +721,18 @@ class XRandR:
         for name, tree in self.configuration.splits.items():
             self._log_tree(name, tree)
 
+        # Clear fakexrandr config so the real physical outputs become
+        # visible to xrandr.  When fakexrandr is active, it replaces
+        # DP-5 with DP-5~1/~2/~3 — clearing the config makes it pass
+        # through, restoring the real DP-5 for the commands below.
+        try:
+            from .fakexrandr_config import CONFIG_PATH
+            if os.path.exists(CONFIG_PATH):
+                os.remove(CONFIG_PATH)
+                log.info("cleared fakexrandr config to expose real outputs")
+        except Exception as e:
+            log.warning("failed to clear fakexrandr config: %s", e)
+
         # Apply main configuration (before any setmonitor calls)
         log.info("applying main xrandr config")
         self._run(*self.configuration.commandlineargs())
@@ -645,24 +789,6 @@ class XRandR:
             except Exception as e:
                 log.warning("fakexrandr config write failed: %s", e)
 
-        # Nudge Muffin to re-read screen resources by re-applying
-        # the xrandr config. This generates CrtcChange events; when
-        # Muffin handles them it calls XRRGetScreenResources, which
-        # triggers fakexrandr to re-read the updated config file.
-        try:
-            from .fakexrandr_config import is_cinnamon_fakexrandr_loaded
-            if is_cinnamon_fakexrandr_loaded():
-                log.info("nudging Muffin to re-read fakexrandr config")
-                # X server round-trip to flush pending events
-                try:
-                    self._output("--listmonitors")
-                except Exception:
-                    import time
-                    time.sleep(0.3)  # fallback
-                self._run(*self.configuration.commandlineargs())
-        except Exception as e:
-            log.warning("fakexrandr nudge failed: %s", e)
-
         # Verify result
         try:
             verify = self._output("--listmonitors")
@@ -704,6 +830,14 @@ class XRandR:
                     from .cinnamon_compat import _wait_cinnamon_on_dbus
                     if not _wait_cinnamon_on_dbus(timeout=15.0):
                         log.warning("Cinnamon did not respond on D-Bus within timeout, proceeding anyway")
+
+                    # Clear fakexrandr config so xrandr sees real outputs
+                    try:
+                        if os.path.exists(CONFIG_PATH):
+                            os.remove(CONFIG_PATH)
+                    except Exception:
+                        pass
+
                     log.info("re-applying xrandr config after Cinnamon restart")
                     self._run(*self.configuration.commandlineargs())
 
