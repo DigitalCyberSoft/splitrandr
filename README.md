@@ -51,7 +51,7 @@ SplitRandR (Python/GTK3)
 ├── cinnamon_compat.py - SIGSTOP/SIGCONT guard for Muffin crash
 ├── fakexrandr_config.py - Binary config writer + monitors.xml writer
 ├── profiles.py     - Named profile management
-└── tray.py         - System tray icon
+└── tray.py         - System tray (XApp → GtkStatusIcon → AppIndicator3 fallback)
 
 fakexrandr/ (vendored C library)
 └── libXrandr.c     - LD_PRELOAD interception of libXrandr + libxcb-randr
@@ -75,16 +75,18 @@ Each split has a direction (`H` for horizontal line, `V` for vertical line) and 
 
 When you click **Apply**:
 
-1. `xrandr --output ... --mode ... --pos ...` sets the physical output configuration
-2. Inside a `CinnamonSetMonitorGuard` (SIGSTOPs Cinnamon):
+1. `~/.config/fakexrandr.bin` is cleared so xrandr sees real physical outputs (not fakexrandr virtual ones)
+2. `xrandr --output ... --mode ... --pos ...` sets the physical output configuration
+3. Inside a `CinnamonSetMonitorGuard` (SIGSTOPs Cinnamon):
    - Existing virtual monitors (`OUTPUT~N`) are deleted
    - New virtual monitors are created via `xrandr --setmonitor`
    - The fakexrandr binary config (`~/.config/fakexrandr.bin`) is written
-3. `cinnamon-monitors.xml` is written with correct positions/modes for all outputs
-4. If Cinnamon doesn't have fakexrandr loaded (checked via `/proc/PID/maps`):
+4. `cinnamon-monitors.xml` is written with correct positions/modes for all outputs
+5. If Cinnamon doesn't have fakexrandr loaded (checked via `/proc/PID/maps`):
    - Cinnamon is restarted with `LD_PRELOAD=.../libXrandr.so.2 cinnamon --replace`
    - After settling, the xrandr config and setmonitor commands are re-applied
    - The fakexrandr binary config is re-written
+6. `xapp-sn-watcher` is restarted so AppIndicator3 tray menus pick up the new monitor geometry (its GDK caches the layout at startup)
 
 ### fakexrandr binary config format
 
@@ -169,6 +171,7 @@ But at login, Cinnamon may not be fully started yet. The autostart `.desktop` en
 - X11 with XRandR 1.2+
 - GCC, libxrandr-dev, libx11-dev, libxcb-randr0-dev (for building fakexrandr)
 - Cinnamon desktop (for the full integration; basic xrandr features work elsewhere)
+- XApp (recommended, for correct tray icon menu positioning on Cinnamon)
 
 ## Building
 
@@ -193,6 +196,15 @@ python -m splitrandr
 4. Click **Split Monitor...** to open the split editor — drag to create splits, right-click a split line to remove it
 5. Click **Apply** to apply the configuration
 6. Click **Apply & Autostart** to also save and register for login autostart
+
+### CLI options
+
+```
+splitrandr --regenerate   # Regenerate autostart script and active profile
+                          # from the current X state without opening the GUI
+```
+
+This is useful after updating SplitRandR to pick up new script features (e.g. `fakexrandr.bin` clearing, `xapp-sn-watcher` restart) without re-doing your layout.
 
 ## Credits
 
