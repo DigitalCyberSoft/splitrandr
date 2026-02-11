@@ -28,6 +28,25 @@ from .i18n import _
 SHELLSHEBANG = '#!/bin/sh'
 
 
+def _restart_sn_watcher():
+    """Restart xapp-sn-watcher so it picks up the new monitor layout.
+
+    The sn-watcher's GDK caches monitor geometry at startup. When
+    setmonitor VMs change the layout, the cached model goes stale,
+    causing AppIndicator3 menus to pop up on the wrong monitor.
+    Killing the watcher lets D-Bus auto-restart it with fresh state.
+    """
+    try:
+        result = subprocess.run(
+            ['pkill', '-x', 'xapp-sn-watcher'],
+            capture_output=True, timeout=5
+        )
+        if result.returncode == 0:
+            log.info("restarted xapp-sn-watcher for monitor layout update")
+    except Exception:
+        pass
+
+
 class Feature:
     PRIMARY = 1
 
@@ -691,7 +710,9 @@ class XRandR:
                 '  # X server round-trip to flush pending RandR events\n'
                 '  xrandr --listmonitors >/dev/null 2>&1\n'
                 '  kill -CONT "$CINNAMON_PID" 2>/dev/null\n'
-                'fi'
+                'fi\n'
+                '# Restart xapp-sn-watcher so AppIndicator3 menus use new monitor layout\n'
+                'pkill -x xapp-sn-watcher 2>/dev/null || true'
             )
         else:
             cinnamon_safe = ''
@@ -893,6 +914,11 @@ class XRandR:
                 restart_cinnamon_without_fakexrandr()
         except Exception as e:
             log.warning("fakexrandr integration failed: %s", e)
+
+        # Restart xapp-sn-watcher so it picks up the new monitor layout.
+        # Its GDK caches monitor geometry and doesn't update on setmonitor
+        # changes, causing AppIndicator3 menus to appear on the wrong monitor.
+        _restart_sn_watcher()
 
         log.info("=== save_to_x: done ===")
 

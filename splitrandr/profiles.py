@@ -110,6 +110,16 @@ def apply_profile(name):
         subprocess.run(['sh', path])
         set_active_profile(name)
 
+        # Restart xapp-sn-watcher so AppIndicator3 menus use new layout
+        # (the profile script runs setmonitor commands that change geometry)
+        try:
+            subprocess.run(
+                ['pkill', '-x', 'xapp-sn-watcher'],
+                capture_output=True, timeout=5
+            )
+        except Exception:
+            pass
+
         # Update fakexrandr config and monitors.xml from current X state
         try:
             from .xrandr import XRandR

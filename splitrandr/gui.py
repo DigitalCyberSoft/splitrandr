@@ -10,6 +10,7 @@
 
 import os
 import optparse
+import stat
 
 import subprocess
 
@@ -930,8 +931,18 @@ def main():
         help='Even run with untested XRandR versions',
         action='store_true'
     )
+    parser.add_option(
+        '--regenerate',
+        help='Regenerate autostart script and active profile from current X state, then exit',
+        action='store_true'
+    )
 
     (options, args) = parser.parse_args()
+
+    if options.regenerate:
+        _regenerate_scripts()
+        return
+
     if not args:
         file_to_open = None
     elif len(args) == 1:
@@ -945,6 +956,33 @@ def main():
         force_version=options.force_version
     )
     app.run()
+
+
+def _regenerate_scripts():
+    """Regenerate autostart script and active profile from current X state."""
+    from .xrandr import XRandR
+
+    xrandr = XRandR(force_version=True)
+    xrandr.load_from_x()
+    script = xrandr.save_to_shellscript_string()
+
+    # Regenerate autostart script
+    autostart_path = Application.AUTOSTART_SCRIPT
+    autostart_dir = os.path.dirname(autostart_path)
+    os.makedirs(autostart_dir, exist_ok=True)
+    with open(autostart_path, 'w') as f:
+        f.write(script)
+    os.chmod(autostart_path, os.stat(autostart_path).st_mode | stat.S_IEXEC)
+    print("Updated autostart: %s" % autostart_path)
+
+    # Regenerate active profile
+    from . import profiles
+    active = profiles.get_active_profile()
+    if active:
+        profiles.save_profile(active, script)
+        print("Updated profile: %s" % active)
+    else:
+        print("No active profile to update")
 
 
 if __name__ == '__main__':
