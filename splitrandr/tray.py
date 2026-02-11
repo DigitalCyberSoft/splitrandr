@@ -6,28 +6,116 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""System tray indicator for SplitRandR using AppIndicator3."""
+"""System tray icon for SplitRandR.
+
+Tries XApp.StatusIcon (Cinnamon-native), then Gtk.StatusIcon,
+then AppIndicator3 as fallback.
+"""
 
 import subprocess
 
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('AppIndicator3', '0.1')
-from gi.repository import Gtk, GLib, AppIndicator3
+from gi.repository import Gtk, GLib
 
 from . import profiles
 from .i18n import _
 
 
-class SplitRandRTray:
-    def __init__(self, app=None):
-        self.app = app
+def _create_backend():
+    """Create the best available tray icon backend."""
+    # Try XApp.StatusIcon first (Cinnamon-native, correct positioning)
+    try:
+        gi.require_version('XApp', '1.0')
+        from gi.repository import XApp
+        return _XAppBackend()
+    except (ValueError, ImportError):
+        pass
+
+    # Try Gtk.StatusIcon (deprecated but works on most DEs)
+    try:
+        return _GtkStatusIconBackend()
+    except Exception:
+        pass
+
+    # Fall back to AppIndicator3
+    gi.require_version('AppIndicator3', '0.1')
+    from gi.repository import AppIndicator3
+    return _AppIndicatorBackend()
+
+
+class _XAppBackend:
+    def __init__(self):
+        from gi.repository import XApp
+        self.icon = XApp.StatusIcon()
+        self.icon.set_icon_name('video-display')
+        self.icon.set_tooltip_text('SplitRandR')
+        self.icon.set_name('splitrandr')
+
+    def set_menu(self, menu):
+        self.icon.set_primary_menu(menu)
+        self.icon.set_secondary_menu(menu)
+
+    def set_activate_callback(self, callback):
+        self.icon.connect('activate', lambda icon, button, time: callback())
+
+    def destroy(self):
+        self.icon.set_visible(False)
+
+
+class _GtkStatusIconBackend:
+    def __init__(self):
+        self.icon = Gtk.StatusIcon()
+        self.icon.set_from_icon_name('video-display')
+        self.icon.set_tooltip_text('SplitRandR')
+        self._menu = None
+
+    def set_menu(self, menu):
+        self._menu = menu
+        try:
+            self.icon.disconnect_by_func(self._on_popup)
+        except TypeError:
+            pass
+        self.icon.connect('popup-menu', self._on_popup)
+
+    def _on_popup(self, icon, button, time):
+        if self._menu:
+            self._menu.popup(None, None,
+                             Gtk.StatusIcon.position_menu, icon,
+                             button, time)
+
+    def set_activate_callback(self, callback):
+        self.icon.connect('activate', lambda icon: callback())
+
+    def destroy(self):
+        self.icon.set_visible(False)
+
+
+class _AppIndicatorBackend:
+    def __init__(self):
+        from gi.repository import AppIndicator3
         self.indicator = AppIndicator3.Indicator.new(
-            'splitrandr',
-            'video-display',
+            'splitrandr', 'video-display',
             AppIndicator3.IndicatorCategory.HARDWARE,
         )
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
+    def set_menu(self, menu):
+        self.indicator.set_menu(menu)
+
+    def set_activate_callback(self, callback):
+        pass  # AppIndicator3 doesn't support left-click activate
+
+    def destroy(self):
+        from gi.repository import AppIndicator3
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.PASSIVE)
+
+
+class SplitRandRTray:
+    def __init__(self, app=None):
+        self.app = app
+        self._backend = _create_backend()
+        self._backend.set_activate_callback(self._on_activate)
         self._build_menu()
 
     def _build_menu(self):
@@ -59,7 +147,7 @@ class SplitRandRTray:
         menu.append(quit_item)
 
         menu.show_all()
-        self.indicator.set_menu(menu)
+        self._backend.set_menu(menu)
 
     def refresh_menu(self):
         self._build_menu()
@@ -121,15 +209,17 @@ class SplitRandRTray:
                     return
             self._build_menu()
 
+    def _on_activate(self):
+        self._on_open_editor(None)
+
     def _on_open_editor(self, _item):
         if self.app and hasattr(self.app, 'window'):
             self.app.window.present()
         else:
-            import subprocess
             subprocess.Popen(['splitrandr'])
 
     def _on_quit(self, _item):
         Gtk.main_quit()
 
     def destroy(self):
-        self.indicator.set_status(AppIndicator3.IndicatorStatus.PASSIVE)
+        self._backend.destroy()

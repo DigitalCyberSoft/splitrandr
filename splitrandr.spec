@@ -23,6 +23,7 @@ Requires:       gtk3
 Requires:       xrandr
 Requires:       libXrandr
 
+Recommends:     xapp
 Recommends:     libappindicator-gtk3
 
 %description
