@@ -33,7 +33,7 @@ class Feature:
 
 
 class XRandR:
-    DEFAULTTEMPLATE = [SHELLSHEBANG, '%(xrandr)s', '%(cinnamon_safe_setmonitors)s']
+    DEFAULTTEMPLATE = [SHELLSHEBANG, '%(clear_fakexrandr)s', '%(xrandr)s', '%(cinnamon_safe_setmonitors)s']
 
     configuration = None
     state = None
@@ -145,6 +145,8 @@ class XRandR:
             'gsettings get', '_i=0', '_v=$(', 'done',
             'xrandr --listmonitors >/dev/null',
             '# Wait for gsettings', '# X server round-trip',
+            # fakexrandr config clearing
+            'fakexrandr.bin',
         ]
         removal_idxs = set(setmonitor_idxs + delmonitor_idxs)
         for i, line in enumerate(lines):
@@ -155,10 +157,13 @@ class XRandR:
             if idx < len(lines) and lines[idx] != '%(xrandr)s':
                 lines.pop(idx)
 
-        # Ensure template has the combined setmonitor marker
+        # Ensure template has all required markers
         xrandr_idx = lines.index('%(xrandr)s')
         if '%(cinnamon_safe_setmonitors)s' not in lines:
             lines.insert(xrandr_idx + 1, '%(cinnamon_safe_setmonitors)s')
+        if '%(clear_fakexrandr)s' not in lines:
+            xrandr_idx = lines.index('%(xrandr)s')
+            lines.insert(xrandr_idx, '%(clear_fakexrandr)s')
 
         return lines
 
@@ -691,7 +696,13 @@ class XRandR:
         else:
             cinnamon_safe = ''
 
+        # Clear fakexrandr config so xrandr sees real physical outputs
+        clear_fakexrandr = (
+            'rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/fakexrandr.bin"'
+        )
+
         data = {
+            'clear_fakexrandr': clear_fakexrandr,
             'xrandr': "xrandr " + " ".join(self.configuration.commandlineargs()),
             'delmonitors': '\n'.join(del_lines),
             'setmonitors': '\n'.join(set_lines),

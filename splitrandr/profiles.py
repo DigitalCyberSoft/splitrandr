@@ -99,6 +99,14 @@ def set_active_profile(name):
 def apply_profile(name):
     path = profile_path(name)
     if os.path.exists(path):
+        # Clear fakexrandr config so the script's xrandr commands
+        # see real physical outputs (e.g. DP-5 instead of DP-5~1/~2/~3)
+        try:
+            from .fakexrandr_config import CONFIG_PATH
+            if os.path.exists(CONFIG_PATH):
+                os.remove(CONFIG_PATH)
+        except Exception:
+            pass
         subprocess.run(['sh', path])
         set_active_profile(name)
 
