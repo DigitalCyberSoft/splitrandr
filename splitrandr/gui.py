@@ -8,6 +8,7 @@
 
 """Main GUI for SplitRandR"""
 
+import math
 import os
 import optparse
 import stat
@@ -380,12 +381,32 @@ class Application:
             self._res_combo.set_sensitive(True)
             self._res_combo.remove_all()
             modes_grouped = output_state.modes_by_resolution()
-            # Sort resolutions by total pixels descending
-            sorted_res = sorted(modes_grouped.keys(), key=lambda k: k[0] * k[1], reverse=True)
+
+            # Compute aspect ratio string for each resolution
+            def _aspect_ratio(w, h):
+                g = math.gcd(w, h)
+                return "%d:%d" % (w // g, h // g)
+
+            # Determine native aspect ratio from preferred mode
+            pref = output_state.preferred_resolution
+            if pref:
+                native_ratio = _aspect_ratio(*pref)
+            else:
+                # Fallback: use the highest-pixel resolution
+                biggest = max(modes_grouped.keys(), key=lambda k: k[0] * k[1])
+                native_ratio = _aspect_ratio(*biggest)
+
+            # Sort: native ratio group first, then others; within each group by pixels desc
+            sorted_res = sorted(
+                modes_grouped.keys(),
+                key=lambda k: (0 if _aspect_ratio(*k) == native_ratio else 1, -(k[0] * k[1]))
+            )
+
             current_res_idx = -1
             for i, (w, h) in enumerate(sorted_res):
-                label = "%dx%d" % (w, h)
-                self._res_combo.append(label, label)
+                ratio = _aspect_ratio(w, h)
+                label = "%dx%d (%s)" % (w, h, ratio)
+                self._res_combo.append("%dx%d" % (w, h), label)
                 if output_cfg.mode.width == w and output_cfg.mode.height == h:
                     current_res_idx = i
             if current_res_idx >= 0:
@@ -936,11 +957,20 @@ def main():
         help='Regenerate autostart script and active profile from current X state, then exit',
         action='store_true'
     )
+    parser.add_option(
+        '--update-configs',
+        help='Write fakexrandr.bin and cinnamon-monitors.xml from current X state, then exit',
+        action='store_true'
+    )
 
     (options, args) = parser.parse_args()
 
     if options.regenerate:
         _regenerate_scripts()
+        return
+
+    if options.update_configs:
+        _update_configs()
         return
 
     if not args:
@@ -983,6 +1013,39 @@ def _regenerate_scripts():
         print("Updated profile: %s" % active)
     else:
         print("No active profile to update")
+
+    # Regenerate fakexrandr config and cinnamon-monitors.xml
+    try:
+        from .fakexrandr_config import (
+            write_fakexrandr_config, write_cinnamon_monitors_xml,
+        )
+        write_fakexrandr_config(
+            xrandr.configuration.splits, xrandr.state, xrandr.configuration
+        )
+        write_cinnamon_monitors_xml(
+            xrandr.configuration.splits, xrandr.state, xrandr.configuration
+        )
+        print("Updated cinnamon-monitors.xml")
+    except Exception as e:
+        print("Warning: failed to update configs: %s" % e)
+
+
+def _update_configs():
+    """Write fakexrandr.bin and cinnamon-monitors.xml from current X state."""
+    from .xrandr import XRandR
+
+    xrandr = XRandR(force_version=True)
+    xrandr.load_from_x()
+
+    from .fakexrandr_config import (
+        write_fakexrandr_config, write_cinnamon_monitors_xml,
+    )
+    write_fakexrandr_config(
+        xrandr.configuration.splits, xrandr.state, xrandr.configuration
+    )
+    write_cinnamon_monitors_xml(
+        xrandr.configuration.splits, xrandr.state, xrandr.configuration
+    )
 
 
 if __name__ == '__main__':

@@ -362,6 +362,8 @@ class XRandR:
                 if "*current" in tokens:
                     currentname = name
                     current_rate = refresh_rate
+                if "+preferred" in tokens and output.preferred_resolution is None:
+                    output.preferred_resolution = (int(w), int(h))
                 for x in ["+preferred", "*current"]:
                     if x in tokens:
                         tokens.remove(x)
@@ -516,6 +518,7 @@ class XRandR:
             phys_state.edid_hex = virt_state.edid_hex
             phys_state.physical_w_mm = pw_mm
             phys_state.physical_h_mm = ph_mm
+            phys_state.preferred_resolution = virt_state.preferred_resolution or (pw, ph)
 
             # Build physical output configuration
             phys_rotation = virt_cfg.rotation if virt_cfg.rotation else NORMAL
@@ -712,7 +715,9 @@ class XRandR:
                 '  kill -CONT "$CINNAMON_PID" 2>/dev/null\n'
                 'fi\n'
                 '# Restart xapp-sn-watcher so AppIndicator3 menus use new monitor layout\n'
-                'pkill -x xapp-sn-watcher 2>/dev/null || true'
+                'pkill -x xapp-sn-watcher 2>/dev/null || true\n'
+                '# Write fakexrandr.bin and cinnamon-monitors.xml to match\n'
+                'python3 -m splitrandr --update-configs 2>/dev/null || true'
             )
         else:
             cinnamon_safe = ''
@@ -973,6 +978,7 @@ class XRandR:
             def __init__(self, name):
                 self.name = name
                 self.modes = []
+                self.preferred_resolution = None  # (w, h) tuple
 
             def __repr__(self):
                 return '<%s %r (%d modes)>' % (type(self).__name__, self.name, len(self.modes))
