@@ -69,17 +69,18 @@ def _find_fakexrandr_lib():
     return None
 
 
-def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config):
+def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
     """Write ~/.config/fakexrandr.bin from the current split configuration.
 
     Binary format per entry:
         <length:4B uint><name:128B padded><edid:768B padded>
-        <width:4B uint><height:4B uint><split_count:4B uint><tree_data>
+        <width:4B uint><height:4B uint><split_count:4B uint><border:4B uint><tree_data>
 
     Args:
         splits_dict: {output_name: SplitTree}
         xrandr_state: XRandR.State with output EDID data
         xrandr_config: XRandR.Configuration with output sizes
+        borders_dict: {output_name: int} border pixels per output (default None)
     """
     entries = []
 
@@ -96,6 +97,7 @@ def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config):
 
         split_count = tree.count_leaves()
         tree_data = tree.to_fakexrandr_bytes(width, height)
+        border = borders_dict.get(output_name, 0) if borders_dict else 0
 
         # Pack the entry (without the leading length field)
         name_bytes = output_name.encode('utf-8')[:128].ljust(128, b'\x00')
@@ -106,6 +108,7 @@ def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config):
             struct.pack('I', width) +
             struct.pack('I', height) +
             struct.pack('I', split_count) +
+            struct.pack('I', border) +
             tree_data
         )
 
@@ -181,7 +184,7 @@ MONITORS_XML_PATH = os.path.join(
 )
 
 
-def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config):
+def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
     """Write ~/.config/cinnamon-monitors.xml with correct display settings.
 
     Generates two configuration blocks:
@@ -213,6 +216,15 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config):
             rate = output_cfg.mode.refresh_rate if output_cfg.mode.refresh_rate else 60.0
 
             regions = list(tree.leaf_regions(w, h, 0, 0, w_mm, h_mm))
+            border = borders_dict.get(output_name, 0) if borders_dict else 0
+            if border > 0:
+                regions = [
+                    (rx + border, ry + border,
+                     rw - 2 * border if rw > 2 * border else rw,
+                     rh - 2 * border if rh > 2 * border else rh,
+                     rmm_w, rmm_h)
+                    for (rx, ry, rw, rh, rmm_w, rmm_h) in regions
+                ]
             for i, (rx, ry, rw, rh, rmm_w, rmm_h) in enumerate(regions):
                 connector = "%s~%d" % (output_name, i)  # 0-indexed, matches setmonitor
                 _add_logicalmonitor(
@@ -348,7 +360,7 @@ def restart_cinnamon_without_fakexrandr():
     return True
 
 
-def ensure_fakexrandr_active(splits_dict, xrandr_state, xrandr_config):
+def ensure_fakexrandr_active(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
     """Write fakexrandr config and restart Cinnamon if needed.
 
     Call this after applying xrandr settings. If splits are active
@@ -366,7 +378,7 @@ def ensure_fakexrandr_active(splits_dict, xrandr_state, xrandr_config):
         return
 
     # Always write/update the config
-    write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config)
+    write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config, borders_dict)
 
     if has_splits:
         if not is_cinnamon_fakexrandr_loaded():

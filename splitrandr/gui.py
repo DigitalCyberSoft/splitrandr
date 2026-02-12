@@ -198,6 +198,18 @@ class Application:
         self._remove_splits_btn.connect('clicked', lambda b: self._on_remove_splits_clicked())
         row3.pack_start(self._remove_splits_btn, False, False, 0)
 
+        row3.pack_start(Gtk.Box(), True, True, 0)  # spacer
+
+        self._border_label = Gtk.Label(label=_("Border:"))
+        row3.pack_start(self._border_label, False, False, 0)
+        adj = Gtk.Adjustment(value=0, lower=0, upper=50, step_increment=1, page_increment=5)
+        self._border_spin = Gtk.SpinButton(adjustment=adj, climb_rate=1, digits=0)
+        self._border_spin.set_width_chars(3)
+        self._border_spin.connect('value-changed', lambda s: self._on_border_changed())
+        row3.pack_start(self._border_spin, False, False, 0)
+        self._border_px_label = Gtk.Label(label=_("px"))
+        row3.pack_start(self._border_px_label, False, False, 0)
+
         self._controls_box.pack_start(row3, False, False, 0)
 
         page.pack_start(self._controls_box, False, False, 0)
@@ -362,6 +374,9 @@ class Application:
                 self._rot_combo.set_sensitive(False)
                 self._split_btn.set_sensitive(False)
                 self._remove_splits_btn.set_sensitive(False)
+                self._border_label.set_sensitive(False)
+                self._border_spin.set_sensitive(False)
+                self._border_px_label.set_sensitive(False)
                 self._res_combo.remove_all()
                 self._rate_combo.remove_all()
                 self._rot_combo.remove_all()
@@ -430,6 +445,14 @@ class Application:
             self._split_btn.set_sensitive(True)
             has_splits = name in xrandr.configuration.splits
             self._remove_splits_btn.set_sensitive(has_splits)
+
+            # Border spin — only sensitive when output has splits
+            self._border_label.set_sensitive(has_splits)
+            self._border_spin.set_sensitive(has_splits)
+            self._border_px_label.set_sensitive(has_splits)
+            self._border_spin.set_value(
+                xrandr.configuration.borders.get(name, 0)
+            )
 
         finally:
             self._updating_controls = False
@@ -572,6 +595,20 @@ class Application:
             return
         self.widget._on_remove_splits(None, name)
 
+    def _on_border_changed(self):
+        if self._updating_controls:
+            return
+        name = self.widget.selected_output
+        if not name:
+            return
+        xrandr = self.widget._xrandr
+        val = int(self._border_spin.get_value())
+        if val > 0:
+            xrandr.configuration.borders[name] = val
+        else:
+            xrandr.configuration.borders.pop(name, None)
+        self.widget._force_repaint()
+
     def _on_detect_displays(self):
         self.filetemplate = self.widget.load_from_x()
 
@@ -648,11 +685,12 @@ class Application:
                     from .fakexrandr_config import (
                         write_fakexrandr_config, write_cinnamon_monitors_xml,
                     )
+                    borders = xrandr.configuration.borders
                     write_fakexrandr_config(
-                        splits, xrandr.state, xrandr.configuration
+                        splits, xrandr.state, xrandr.configuration, borders
                     )
                     write_cinnamon_monitors_xml(
-                        splits, xrandr.state, xrandr.configuration
+                        splits, xrandr.state, xrandr.configuration, borders
                     )
             except Exception:
                 pass
@@ -1019,11 +1057,12 @@ def _regenerate_scripts():
         from .fakexrandr_config import (
             write_fakexrandr_config, write_cinnamon_monitors_xml,
         )
+        borders = xrandr.configuration.borders
         write_fakexrandr_config(
-            xrandr.configuration.splits, xrandr.state, xrandr.configuration
+            xrandr.configuration.splits, xrandr.state, xrandr.configuration, borders
         )
         write_cinnamon_monitors_xml(
-            xrandr.configuration.splits, xrandr.state, xrandr.configuration
+            xrandr.configuration.splits, xrandr.state, xrandr.configuration, borders
         )
         print("Updated cinnamon-monitors.xml")
     except Exception as e:
@@ -1037,14 +1076,33 @@ def _update_configs():
     xrandr = XRandR(force_version=True)
     xrandr.load_from_x()
 
+    # Try to load borders from the autostart script if it exists
+    borders = xrandr.configuration.borders
+    autostart = Application.AUTOSTART_SCRIPT
+    if not borders and os.path.exists(autostart):
+        try:
+            with open(autostart) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('# splitrandr-border:'):
+                        spec = line[len('# splitrandr-border:'):]
+                        if '=' in spec:
+                            bname, bval = spec.split('=', 1)
+                            try:
+                                borders[bname] = int(bval)
+                            except ValueError:
+                                pass
+        except Exception:
+            pass
+
     from .fakexrandr_config import (
         write_fakexrandr_config, write_cinnamon_monitors_xml,
     )
     write_fakexrandr_config(
-        xrandr.configuration.splits, xrandr.state, xrandr.configuration
+        xrandr.configuration.splits, xrandr.state, xrandr.configuration, borders
     )
     write_cinnamon_monitors_xml(
-        xrandr.configuration.splits, xrandr.state, xrandr.configuration
+        xrandr.configuration.splits, xrandr.state, xrandr.configuration, borders
     )
 
 

@@ -502,9 +502,11 @@ class ARandRWidget(Gtk.DrawingArea):
 
             # Draw split overlay if this output has splits
             if output_name in cfg.splits:
+                border = cfg.borders.get(output_name, 0)
                 self._draw_split_overlay(
                     context, cfg.splits[output_name],
-                    rect[0], rect[1], rect[2], rect[3]
+                    rect[0], rect[1], rect[2], rect[3],
+                    border
                 )
 
             # Draw output name: large, bold, white on dark backdrop
@@ -553,12 +555,22 @@ class ARandRWidget(Gtk.DrawingArea):
 
             context.restore()
 
-    def _draw_split_overlay(self, context, tree, x, y, w, h):
+    def _draw_split_overlay(self, context, tree, x, y, w, h, border=0):
         """Draw semi-transparent colored regions for each split sub-monitor."""
         regions = list(tree.leaf_regions_proportional())
+        # Compute border as proportion of monitor dimensions
+        bx_frac = border / w if w > 0 else 0
+        by_frac = border / h if h > 0 else 0
         for i, (rx, ry, rw, rh) in enumerate(regions):
             ci = i % len(SPLIT_COLORS)
             color = SPLIT_COLORS[ci]
+
+            # Apply border inset (proportional)
+            if border > 0:
+                rx += bx_frac
+                ry += by_frac
+                rw = max(rw - 2 * bx_frac, 0)
+                rh = max(rh - 2 * by_frac, 0)
 
             px = x + rx * w
             py = y + ry * h

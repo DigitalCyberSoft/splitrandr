@@ -153,6 +153,18 @@ class XRandR:
         self._load_splits_from_setmonitor_lines(
             [lines[i].strip() for i in setmonitor_idxs])
 
+        # Parse border comments (# splitrandr-border:OUTPUT=N)
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('# splitrandr-border:'):
+                border_spec = stripped[len('# splitrandr-border:'):]
+                if '=' in border_spec:
+                    bname, bval = border_spec.split('=', 1)
+                    try:
+                        self.configuration.borders[bname] = int(bval)
+                    except ValueError:
+                        pass
+
         # Remove setmonitor/delmonitor lines and Cinnamon-safety wrapper lines
         cinnamon_wrapper_patterns = [
             'CINNAMON_PID=', 'pgrep -x cinnamon',
@@ -166,6 +178,8 @@ class XRandR:
             '# Wait for gsettings', '# X server round-trip',
             # fakexrandr config clearing
             'fakexrandr.bin',
+            # border config comments
+            'splitrandr-border:',
         ]
         removal_idxs = set(setmonitor_idxs + delmonitor_idxs)
         for i, line in enumerate(lines):
@@ -690,6 +704,13 @@ class XRandR:
                 del_lines.append("xrandr --delmonitor %s 2>/dev/null || true" % mon_name)
                 set_lines.append("xrandr --setmonitor %s %s %s" % (mon_name, geom, out))
 
+        # Generate border comments for persistence
+        border_comments = []
+        for output_name, border_val in self.configuration.borders.items():
+            if border_val > 0 and output_name in self.configuration.splits:
+                border_comments.append(
+                    '# splitrandr-border:%s=%d' % (output_name, border_val))
+
         # Generate Cinnamon-safe wrapper for setmonitor commands
         # Muffin >= 5.4.0 segfaults on setmonitor events, so we
         # SIGSTOP Cinnamon and disable csd-xrandr during these calls.
@@ -709,7 +730,8 @@ class XRandR:
                 '  kill -STOP "$CINNAMON_PID" 2>/dev/null\n'
                 'fi\n'
                 + monitor_cmds + '\n'
-                'if [ -n "$CINNAMON_PID" ]; then\n'
+                + ('\n'.join(border_comments) + '\n' if border_comments else '')
+                + 'if [ -n "$CINNAMON_PID" ]; then\n'
                 '  # X server round-trip to flush pending RandR events\n'
                 '  xrandr --listmonitors >/dev/null 2>&1\n'
                 '  kill -CONT "$CINNAMON_PID" 2>/dev/null\n'
@@ -821,7 +843,8 @@ class XRandR:
             try:
                 from .fakexrandr_config import write_fakexrandr_config
                 write_fakexrandr_config(
-                    self.configuration.splits, self.state, self.configuration
+                    self.configuration.splits, self.state, self.configuration,
+                    self.configuration.borders
                 )
             except Exception as e:
                 log.warning("fakexrandr config write failed: %s", e)
@@ -851,7 +874,8 @@ class XRandR:
             # display settings (positions, modes, primary) on restart.
             try:
                 write_cinnamon_monitors_xml(
-                    self.configuration.splits, self.state, self.configuration
+                    self.configuration.splits, self.state, self.configuration,
+                    self.configuration.borders
                 )
             except Exception as e:
                 log.warning("monitors.xml write failed: %s", e)
@@ -909,7 +933,8 @@ class XRandR:
 
                         from .fakexrandr_config import write_fakexrandr_config
                         write_fakexrandr_config(
-                            self.configuration.splits, self.state, self.configuration
+                            self.configuration.splits, self.state, self.configuration,
+                            self.configuration.borders
                         )
 
                     log.info("re-applied config after Cinnamon restart")
@@ -1006,6 +1031,7 @@ class XRandR:
         def __init__(self, xrandr):
             self.outputs = {}
             self.splits = {}
+            self.borders = {}
             self._xrandr = xrandr
 
         def __repr__(self):

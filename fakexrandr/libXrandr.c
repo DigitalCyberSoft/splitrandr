@@ -100,10 +100,20 @@ static char *config_file;
 static int config_file_fd;
 static size_t config_file_size;
 
-static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x, unsigned int y, unsigned int width, unsigned int height, XRRScreenResources *resources, RROutput output, XRROutputInfo *output_info,
+static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x, unsigned int y, unsigned int width, unsigned int height, unsigned int border, XRRScreenResources *resources, RROutput output, XRROutputInfo *output_info,
 		XRRCrtcInfo *crtc_info, struct FakeInfo ***fake_crtcs, struct FakeInfo ***fake_outputs, struct FakeInfo ***fake_modes) {
 
+	if(config[0] != 'N' && config[0] != 'H' && config[0] != 'V') {
+		// Corrupt or incompatible config — bail out silently
+		return NULL;
+	}
+
 	if(config[0] == 'N') {
+		// Apply border inset to the leaf region
+		unsigned int bx = x + border;
+		unsigned int by = y + border;
+		unsigned int bw = (width > 2 * border) ? width - 2 * border : width;
+		unsigned int bh = (height > 2 * border) ? height - 2 * border : height;
 		// Define a new output info
 		**fake_outputs = Xmalloc(sizeof(struct FakeInfo) + sizeof(XRROutputInfo) + output_info->nameLen + sizeof("~NNN ") + sizeof(RRCrtc) + sizeof(RROutput) * output_info->nclone + (1 + output_info->nmode) * sizeof(RRMode));
 		(**fake_outputs)->xid = (output & ~XID_SPLIT_MASK) | ((++(*n)) << XID_SPLIT_SHIFT);
@@ -112,8 +122,8 @@ static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x
 		fake_info->timestamp = output_info->timestamp;
 		fake_info->name = (void*)fake_info + sizeof(XRROutputInfo);
 		fake_info->nameLen = sprintf(fake_info->name, "%s~%d", output_info->name, (*n));
-		fake_info->mm_width = output_info->mm_width * width / crtc_info->width;
-		fake_info->mm_height = output_info->mm_height * height / crtc_info->height;
+		fake_info->mm_width = output_info->mm_width * bw / crtc_info->width;
+		fake_info->mm_height = output_info->mm_height * bh / crtc_info->height;
 		fake_info->connection = output_info->connection;
 		fake_info->subpixel_order = output_info->subpixel_order;
 		fake_info->ncrtc = 1;
@@ -139,10 +149,10 @@ static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x
 		(**fake_crtcs)->parent_xid = output_info->crtc;
 		XRRCrtcInfo *fake_crtc_info = (**fake_crtcs)->info = ((void*)**fake_crtcs) + sizeof(struct FakeInfo);
 		*fake_crtc_info = *crtc_info;
-		fake_crtc_info->x = crtc_info->x + x;
-		fake_crtc_info->y = crtc_info->y + y;
-		fake_crtc_info->width = width;
-		fake_crtc_info->height = height;
+		fake_crtc_info->x = crtc_info->x + bx;
+		fake_crtc_info->y = crtc_info->y + by;
+		fake_crtc_info->width = bw;
+		fake_crtc_info->height = bh;
 		fake_crtc_info->mode = *(fake_info->modes);
 		fake_crtc_info->noutput = 1;
 		fake_crtc_info->outputs = (void*)fake_crtc_info + sizeof(XRRCrtcInfo);
@@ -165,10 +175,10 @@ static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x
 			}
 		}
 		fake_mode_info->id = (**fake_modes)->xid;
-		fake_mode_info->width = width;
-		fake_mode_info->height = height;
+		fake_mode_info->width = bw;
+		fake_mode_info->height = bh;
 		fake_mode_info->name = (void*)fake_mode_info + sizeof(XRRModeInfo);
-		fake_mode_info->nameLength = sprintf(fake_mode_info->name, "%dx%d", width, height);
+		fake_mode_info->nameLength = sprintf(fake_mode_info->name, "%dx%d", bw, bh);
 
 		*fake_modes = &(**fake_modes)->next;
 		**fake_modes = NULL;
@@ -179,16 +189,16 @@ static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x
 	if(config[0] == 'H') {
 		// PR #27: treat split_pos == 0 as "divide equally"
 		if(split_pos == 0) split_pos = height / 2;
-		config = _config_foreach_split(config + 1 + 4, n, x, y, width, split_pos, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
-		return _config_foreach_split(config, n, x, y + split_pos, width, height - split_pos, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
+		config = _config_foreach_split(config + 1 + 4, n, x, y, width, split_pos, border, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
+		if(!config) return NULL;
+		return _config_foreach_split(config, n, x, y + split_pos, width, height - split_pos, border, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
 	}
 	else {
-		assert(config[0] == 'V');
-
 		// PR #27: treat split_pos == 0 as "divide equally"
 		if(split_pos == 0) split_pos = width / 2;
-		config = _config_foreach_split(config + 1 + 4, n, x, y, split_pos, height, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
-		return _config_foreach_split(config, n, x + split_pos, y, width - split_pos, height, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
+		config = _config_foreach_split(config + 1 + 4, n, x, y, split_pos, height, border, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
+		if(!config) return NULL;
+		return _config_foreach_split(config, n, x + split_pos, y, width - split_pos, height, border, resources, output, output_info, crtc_info, fake_crtcs, fake_outputs, fake_modes);
 	}
 }
 
@@ -219,9 +229,23 @@ static int config_handle_output(Display *dpy, XRRScreenResources *resources, RRO
 			unsigned int effective_height = height ? height : output_crtc->height;
 
 			if(output_crtc->width == effective_width && output_crtc->height == effective_height) {
+				// Read border value (uint32 after split_count)
+				unsigned int border = *(unsigned int *)&config[4 + 128 + 768 + 4 + 4 + 4];
+
+				// Sanity check: border must be reasonable (< 200px).
+				// If it's huge, this is likely an old-format config without a border field —
+				// treat border as 0 and read tree_data at the old offset.
+				char *tree_start;
+				if(border > 200) {
+					border = 0;
+					tree_start = config + 4 + 128 + 768 + 4 + 4 + 4;  // old format
+				} else {
+					tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;  // new format
+				}
+
 				// If it is found and the size matches, add fake outputs/crtcs to the list
 				unsigned n = 0;
-				_config_foreach_split(config + 4 + 128 + 768 + 4 + 4 + 4, &n, 0, 0, effective_width, effective_height, resources, output, output_info, output_crtc, fake_crtcs, fake_outputs, fake_modes);
+				_config_foreach_split(tree_start, &n, 0, 0, effective_width, effective_height, border, resources, output, output_info, output_crtc, fake_crtcs, fake_outputs, fake_modes);
 				return 1;
 			}
 		}
