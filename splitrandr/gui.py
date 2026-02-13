@@ -1032,10 +1032,25 @@ def _regenerate_scripts():
 
     xrandr = XRandR(force_version=True)
     xrandr.load_from_x()
+
+    # Preserve pre-commands (e.g. xset -dpms) from the existing autostart script
+    autostart_path = Application.AUTOSTART_SCRIPT
+    if os.path.exists(autostart_path):
+        try:
+            existing = open(autostart_path).read()
+            pre_cmds = []
+            for line in existing.split('\n'):
+                stripped = line.strip()
+                if stripped.startswith('xset '):
+                    pre_cmds.append(stripped)
+            if pre_cmds:
+                xrandr.configuration._pre_commands = pre_cmds
+        except Exception:
+            pass
+
     script = xrandr.save_to_shellscript_string()
 
     # Regenerate autostart script
-    autostart_path = Application.AUTOSTART_SCRIPT
     autostart_dir = os.path.dirname(autostart_path)
     os.makedirs(autostart_dir, exist_ok=True)
     with open(autostart_path, 'w') as f:

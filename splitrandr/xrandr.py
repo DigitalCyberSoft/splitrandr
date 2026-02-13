@@ -52,7 +52,7 @@ class Feature:
 
 
 class XRandR:
-    DEFAULTTEMPLATE = [SHELLSHEBANG, '%(clear_fakexrandr)s', '%(xrandr)s', '%(cinnamon_safe_setmonitors)s']
+    DEFAULTTEMPLATE = [SHELLSHEBANG, '%(pre_commands)s', '%(clear_fakexrandr)s', '%(xrandr)s', '%(cinnamon_safe_setmonitors)s']
 
     configuration = None
     state = None
@@ -112,6 +112,33 @@ class XRandR:
         if status != 0:
             log.warning("xrandr (ignored) exit %d stderr: %s", status, err.decode('utf-8', errors='replace'))
 
+    def _run_no_preload(self, *args):
+        """Run xrandr with LD_PRELOAD stripped (for setmonitor commands)."""
+        env = {k: v for k, v in self.environ.items() if k != 'LD_PRELOAD'}
+        log.info("xrandr (no-preload) %s", " ".join(args))
+        proc = subprocess.Popen(
+            ("xrandr",) + args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+        )
+        out, err = proc.communicate()
+        status = proc.wait()
+        if status != 0:
+            log.error("xrandr (no-preload) exit %d stderr: %s", status, err.decode('utf-8', errors='replace'))
+            raise Exception("XRandR returned error code %d: %s" % (status, err))
+
+    def _run_no_preload_ignore_error(self, *args):
+        """Run xrandr with LD_PRELOAD stripped, ignoring errors."""
+        env = {k: v for k, v in self.environ.items() if k != 'LD_PRELOAD'}
+        log.info("xrandr (no-preload, ignore-error) %s", " ".join(args))
+        proc = subprocess.Popen(
+            ("xrandr",) + args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+        )
+        out, err = proc.communicate()
+        status = proc.wait()
+        if status != 0:
+            log.warning("xrandr (no-preload, ignored) exit %d stderr: %s", status, err.decode('utf-8', errors='replace'))
+
     #################### loading ####################
 
     def load_from_string(self, data):
@@ -124,7 +151,8 @@ class XRandR:
             raise FileLoadError('Not a shell script.')
 
         xrandrlines = [i for i, l in enumerate(
-            lines) if l.strip().startswith('xrandr ')]
+            lines) if l.strip().startswith('xrandr ') or
+            'xrandr ' in l.strip()]
         if not xrandrlines:
             raise FileLoadError('No recognized xrandr command in this shell script.')
 
@@ -190,6 +218,20 @@ class XRandR:
             if idx < len(lines) and lines[idx] != '%(xrandr)s':
                 lines.pop(idx)
 
+        # Collect pre-commands (e.g. xset -dpms) and replace with marker
+        pre_cmd_idxs = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('xset '):
+                pre_cmd_idxs.append(i)
+        if pre_cmd_idxs:
+            # Store them in configuration for re-emission
+            self.configuration._pre_commands = [lines[i].strip() for i in pre_cmd_idxs]
+            for idx in sorted(pre_cmd_idxs, reverse=True):
+                lines.pop(idx)
+        else:
+            self.configuration._pre_commands = []
+
         # Ensure template has all required markers
         xrandr_idx = lines.index('%(xrandr)s')
         if '%(cinnamon_safe_setmonitors)s' not in lines:
@@ -197,6 +239,10 @@ class XRandR:
         if '%(clear_fakexrandr)s' not in lines:
             xrandr_idx = lines.index('%(xrandr)s')
             lines.insert(xrandr_idx, '%(clear_fakexrandr)s')
+        if '%(pre_commands)s' not in lines:
+            # Insert before clear_fakexrandr
+            clear_idx = lines.index('%(clear_fakexrandr)s')
+            lines.insert(clear_idx, '%(pre_commands)s')
 
         return lines
 
@@ -694,15 +740,16 @@ class XRandR:
             output_state = self.state.outputs.get(output_name)
             w_mm = output_state.physical_w_mm if output_state else 0
             h_mm = output_state.physical_h_mm if output_state else 0
+            border = self.configuration.borders.get(output_name, 0)
             commands = tree.to_setmonitor_commands(
                 output_name,
                 output_cfg.size[0], output_cfg.size[1],
                 output_cfg.position[0], output_cfg.position[1],
-                w_mm, h_mm
+                w_mm, h_mm, border
             )
             for mon_name, geom, out in commands:
-                del_lines.append("xrandr --delmonitor %s 2>/dev/null || true" % mon_name)
-                set_lines.append("xrandr --setmonitor %s %s %s" % (mon_name, geom, out))
+                del_lines.append("env -u LD_PRELOAD xrandr --delmonitor %s 2>/dev/null || true" % mon_name)
+                set_lines.append("env -u LD_PRELOAD xrandr --setmonitor %s %s %s" % (mon_name, geom, out))
 
         # Generate border comments for persistence
         border_comments = []
@@ -749,7 +796,9 @@ class XRandR:
             'rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/fakexrandr.bin"'
         )
 
+        pre_cmds = getattr(self.configuration, '_pre_commands', [])
         data = {
+            'pre_commands': '\n'.join(pre_cmds) if pre_cmds else '',
             'clear_fakexrandr': clear_fakexrandr,
             'xrandr': "xrandr " + " ".join(self.configuration.commandlineargs()),
             'delmonitors': '\n'.join(del_lines),
@@ -814,7 +863,7 @@ class XRandR:
                         mon_name = m.group(1)
                         if '~' in mon_name:
                             log.info("deleting virtual monitor: %s", mon_name)
-                            self._run_ignore_error("--delmonitor", mon_name)
+                            self._run_no_preload_ignore_error("--delmonitor", mon_name)
             except Exception as e:
                 log.warning("listmonitors failed: %s", e)
 
@@ -827,16 +876,17 @@ class XRandR:
                 output_state = self.state.outputs.get(output_name)
                 w_mm = output_state.physical_w_mm if output_state else 0
                 h_mm = output_state.physical_h_mm if output_state else 0
+                border = self.configuration.borders.get(output_name, 0)
                 commands = tree.to_setmonitor_commands(
                     output_name,
                     output_cfg.size[0], output_cfg.size[1],
                     output_cfg.position[0], output_cfg.position[1],
-                    w_mm, h_mm
+                    w_mm, h_mm, border
                 )
                 log.info("creating %d virtual monitors for %s", len(commands), output_name)
                 for mon_name, geom, out in commands:
                     log.info("  setmonitor %s %s %s", mon_name, geom, out)
-                    self._run("--setmonitor", mon_name, geom, out)
+                    self._run_no_preload("--setmonitor", mon_name, geom, out)
 
             # Write fakexrandr config BEFORE Cinnamon resumes, so it
             # reads the new config when it processes the queued RandR events.
@@ -911,7 +961,7 @@ class XRandR:
                                     continue
                                 m_mon = re.match(r'\d+:\s+[+*]*(\S+)', line)
                                 if m_mon and '~' in m_mon.group(1):
-                                    self._run_ignore_error("--delmonitor", m_mon.group(1))
+                                    self._run_no_preload_ignore_error("--delmonitor", m_mon.group(1))
                         except Exception:
                             pass
 
@@ -922,14 +972,15 @@ class XRandR:
                             output_state = self.state.outputs.get(output_name)
                             w_mm = output_state.physical_w_mm if output_state else 0
                             h_mm = output_state.physical_h_mm if output_state else 0
+                            border = self.configuration.borders.get(output_name, 0)
                             commands = tree.to_setmonitor_commands(
                                 output_name,
                                 output_cfg.size[0], output_cfg.size[1],
                                 output_cfg.position[0], output_cfg.position[1],
-                                w_mm, h_mm
+                                w_mm, h_mm, border
                             )
                             for mon_name, geom, out in commands:
-                                self._run("--setmonitor", mon_name, geom, out)
+                                self._run_no_preload("--setmonitor", mon_name, geom, out)
 
                         from .fakexrandr_config import write_fakexrandr_config
                         write_fakexrandr_config(

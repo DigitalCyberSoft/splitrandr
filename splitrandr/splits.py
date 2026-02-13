@@ -141,14 +141,21 @@ class SplitTree:
             self.right._collect_edges(
                 px, py, x, edge_y, w, h * (1 - self.proportion), self, False, results)
 
-    def to_setmonitor_commands(self, output_name, width, height, x_off, y_off, w_mm, h_mm):
+    def to_setmonitor_commands(self, output_name, width, height, x_off, y_off, w_mm, h_mm, border=0):
         """Generate xrandr --setmonitor argument lists.
         Returns list of (monitor_name, geometry_str, output_or_none).
         First sub-monitor gets the real output name, rest get 'none'.
+        If border > 0, each region is inset by that many pixels to create
+        mouse dead zones between adjacent virtual monitors.
         """
         regions = list(self.leaf_regions(width, height, x_off, y_off, w_mm, h_mm))
         commands = []
         for i, (rx, ry, rw, rh, rmm_w, rmm_h) in enumerate(regions):
+            if border > 0:
+                rx += border
+                ry += border
+                rw = max(rw - 2 * border, 1)
+                rh = max(rh - 2 * border, 1)
             mon_name = "%s~%d" % (output_name, i)
             geom = "%d/%dx%d/%d+%d+%d" % (rw, rmm_w, rh, rmm_h, rx, ry)
             out = output_name if i == 0 else "none"
