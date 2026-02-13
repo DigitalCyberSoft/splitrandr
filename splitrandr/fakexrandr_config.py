@@ -225,17 +225,30 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, border
                     primary=False, scale=1
                 )
         else:
-            # No splits — add as real output
+            # No splits — check if this output has a border
+            border = borders_dict.get(output_name, 0) if borders_dict else 0
             edid = output_state.edid_hex if output_state else ""
             vendor, product, serial = _parse_edid_monitorspec(edid)
             rate = output_cfg.mode.refresh_rate if output_cfg.mode.refresh_rate else 60.0
-            _add_logicalmonitor(
-                split_config, output_name,
-                vendor, product, serial,
-                output_cfg.position[0], output_cfg.position[1],
-                output_cfg.size[0], output_cfg.size[1], rate,
-                primary=output_cfg.primary, scale=1
-            )
+            if border > 0:
+                # Unsplit output with border gets a virtual ~0 connector
+                ox, oy = output_cfg.position
+                w, h = output_cfg.size
+                _add_logicalmonitor(
+                    split_config, "%s~0" % output_name,
+                    "unknown", "unknown", "unknown",
+                    ox + border, oy + border,
+                    max(w - 2 * border, 1), max(h - 2 * border, 1), rate,
+                    primary=output_cfg.primary, scale=1
+                )
+            else:
+                _add_logicalmonitor(
+                    split_config, output_name,
+                    vendor, product, serial,
+                    output_cfg.position[0], output_cfg.position[1],
+                    output_cfg.size[0], output_cfg.size[1], rate,
+                    primary=output_cfg.primary, scale=1
+                )
 
     # --- Configuration 2: Unsplit layout (no fakexrandr) ---
     unsplit_config = ET.SubElement(root, 'configuration')

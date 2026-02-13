@@ -446,10 +446,10 @@ class Application:
             has_splits = name in xrandr.configuration.splits
             self._remove_splits_btn.set_sensitive(has_splits)
 
-            # Border spin — only sensitive when output has splits
-            self._border_label.set_sensitive(has_splits)
-            self._border_spin.set_sensitive(has_splits)
-            self._border_px_label.set_sensitive(has_splits)
+            # Border spin — sensitive for any active output
+            self._border_label.set_sensitive(True)
+            self._border_spin.set_sensitive(True)
+            self._border_px_label.set_sensitive(True)
             self._border_spin.set_value(
                 xrandr.configuration.borders.get(name, 0)
             )

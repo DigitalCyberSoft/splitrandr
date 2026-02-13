@@ -751,10 +751,29 @@ class XRandR:
                 del_lines.append("env -u LD_PRELOAD xrandr --delmonitor %s 2>/dev/null || true" % mon_name)
                 set_lines.append("env -u LD_PRELOAD xrandr --setmonitor %s %s %s" % (mon_name, geom, out))
 
+        # Generate setmonitor for unsplit outputs that have a border
+        for output_name, border_val in self.configuration.borders.items():
+            if border_val <= 0 or output_name in self.configuration.splits:
+                continue
+            output_cfg = self.configuration.outputs.get(output_name)
+            if not output_cfg or not output_cfg.active:
+                continue
+            output_state = self.state.outputs.get(output_name)
+            w_mm = output_state.physical_w_mm if output_state else 0
+            h_mm = output_state.physical_h_mm if output_state else 0
+            w, h = output_cfg.size
+            ox, oy = output_cfg.position
+            bw = max(w - 2 * border_val, 1)
+            bh = max(h - 2 * border_val, 1)
+            mon_name = "%s~0" % output_name
+            geom = "%d/%dx%d/%d+%d+%d" % (bw, w_mm, bh, h_mm, ox + border_val, oy + border_val)
+            del_lines.append("env -u LD_PRELOAD xrandr --delmonitor %s 2>/dev/null || true" % mon_name)
+            set_lines.append("env -u LD_PRELOAD xrandr --setmonitor %s %s %s" % (mon_name, geom, output_name))
+
         # Generate border comments for persistence
         border_comments = []
         for output_name, border_val in self.configuration.borders.items():
-            if border_val > 0 and output_name in self.configuration.splits:
+            if border_val > 0:
                 border_comments.append(
                     '# splitrandr-border:%s=%d' % (output_name, border_val))
 
@@ -888,6 +907,25 @@ class XRandR:
                     log.info("  setmonitor %s %s %s", mon_name, geom, out)
                     self._run_no_preload("--setmonitor", mon_name, geom, out)
 
+            # Create setmonitor for unsplit outputs that have a border
+            for output_name, border_val in self.configuration.borders.items():
+                if border_val <= 0 or output_name in self.configuration.splits:
+                    continue
+                output_cfg = self.configuration.outputs.get(output_name)
+                if not output_cfg or not output_cfg.active:
+                    continue
+                output_state = self.state.outputs.get(output_name)
+                w_mm = output_state.physical_w_mm if output_state else 0
+                h_mm = output_state.physical_h_mm if output_state else 0
+                w, h = output_cfg.size
+                ox, oy = output_cfg.position
+                bw = max(w - 2 * border_val, 1)
+                bh = max(h - 2 * border_val, 1)
+                mon_name = "%s~0" % output_name
+                geom = "%d/%dx%d/%d+%d+%d" % (bw, w_mm, bh, h_mm, ox + border_val, oy + border_val)
+                log.info("creating border setmonitor for unsplit %s: %s %s", output_name, mon_name, geom)
+                self._run_no_preload("--setmonitor", mon_name, geom, output_name)
+
             # Write fakexrandr config BEFORE Cinnamon resumes, so it
             # reads the new config when it processes the queued RandR events.
             try:
@@ -981,6 +1019,24 @@ class XRandR:
                             )
                             for mon_name, geom, out in commands:
                                 self._run_no_preload("--setmonitor", mon_name, geom, out)
+
+                        # Unsplit outputs with border
+                        for output_name, border_val in self.configuration.borders.items():
+                            if border_val <= 0 or output_name in self.configuration.splits:
+                                continue
+                            output_cfg = self.configuration.outputs.get(output_name)
+                            if not output_cfg or not output_cfg.active:
+                                continue
+                            output_state = self.state.outputs.get(output_name)
+                            w_mm = output_state.physical_w_mm if output_state else 0
+                            h_mm = output_state.physical_h_mm if output_state else 0
+                            w, h = output_cfg.size
+                            ox, oy = output_cfg.position
+                            bw = max(w - 2 * border_val, 1)
+                            bh = max(h - 2 * border_val, 1)
+                            mon_name = "%s~0" % output_name
+                            geom = "%d/%dx%d/%d+%d+%d" % (bw, w_mm, bh, h_mm, ox + border_val, oy + border_val)
+                            self._run_no_preload("--setmonitor", mon_name, geom, output_name)
 
                         from .fakexrandr_config import write_fakexrandr_config
                         write_fakexrandr_config(

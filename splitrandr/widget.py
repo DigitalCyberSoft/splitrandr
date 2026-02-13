@@ -508,6 +508,25 @@ class ARandRWidget(Gtk.DrawingArea):
                     rect[0], rect[1], rect[2], rect[3],
                     border
                 )
+            elif cfg.borders.get(output_name, 0) > 0:
+                # Unsplit output with border — show inset region
+                border = cfg.borders[output_name]
+                oc = cfg.outputs[output_name]
+                bx_frac = border / oc.size[0] if oc.size[0] > 0 else 0
+                by_frac = border / oc.size[1] if oc.size[1] > 0 else 0
+                px = rect[0] + bx_frac * rect[2]
+                py = rect[1] + by_frac * rect[3]
+                pw = max(rect[2] * (1 - 2 * bx_frac), 0)
+                ph = max(rect[3] * (1 - 2 * by_frac), 0)
+                context.set_source_rgba(0.4, 0.7, 0.4, 0.2)
+                context.rectangle(px, py, pw, ph)
+                context.fill()
+                context.set_source_rgba(0.4, 0.7, 0.4, 0.5)
+                context.set_line_width(1)
+                context.set_dash([4, 3])
+                context.rectangle(px, py, pw, ph)
+                context.stroke()
+                context.set_dash([])
 
             # Draw output name: large, bold, white on dark backdrop
             context.save()
