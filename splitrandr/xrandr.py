@@ -252,14 +252,21 @@ class XRandR:
         monitors_by_output = {}
         for line in setmonitor_lines:
             # xrandr --setmonitor NAME WIDTHpx/WIDTHmm x HEIGHTpx/HEIGHTmm + X + Y OUTPUT
-            # or: xrandr --setmonitor NAME W/Wmm*H/Hmm+X+Y OUTPUT
+            # or: env -u LD_PRELOAD xrandr --setmonitor NAME W/Wmm*H/Hmm+X+Y OUTPUT
             parts = line.split()
-            if len(parts) < 4 or parts[0] != 'xrandr' or parts[1] != '--setmonitor':
+            # Find 'xrandr' '--setmonitor' in the parts (may be prefixed by env -u LD_PRELOAD)
+            try:
+                xr_idx = parts.index('xrandr')
+            except ValueError:
+                continue
+            if xr_idx + 1 >= len(parts) or parts[xr_idx + 1] != '--setmonitor':
+                continue
+            if xr_idx + 4 > len(parts):
                 continue
 
-            mon_name = parts[2]
-            geom_str = parts[3]
-            output = parts[4] if len(parts) > 4 else 'none'
+            mon_name = parts[xr_idx + 2]
+            geom_str = parts[xr_idx + 3]
+            output = parts[xr_idx + 4] if xr_idx + 4 < len(parts) else 'none'
 
             # Parse monitor name: OUTPUT~INDEX
             if '~' not in mon_name:
