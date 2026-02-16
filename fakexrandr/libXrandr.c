@@ -105,8 +105,8 @@ struct FakeScreenResources {
 static char *config_file;
 static int config_file_fd;
 static size_t config_file_size;
-static size_t config_data_offset;  /* 0 for old format, 8 for new (after FXRD header) */
-static int config_has_border_field; /* 1 if config was written with border field */
+/* Config data starts at offset 8 (after "FXRD" + uint32 version header) */
+#define CONFIG_DATA_OFFSET 8
 
 static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x, unsigned int y, unsigned int width, unsigned int height, unsigned int border, XRRScreenResources *resources, RROutput output, XRROutputInfo *output_info,
 		XRRCrtcInfo *crtc_info, struct FakeInfo ***fake_crtcs, struct FakeInfo ***fake_outputs, struct FakeInfo ***fake_modes) {
@@ -210,7 +210,7 @@ static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x
 
 static int config_handle_output(Display *dpy, XRRScreenResources *resources, RROutput output, char *target_edid, const char *target_name, struct FakeInfo ***fake_crtcs, struct FakeInfo ***fake_outputs, struct FakeInfo ***fake_modes) {
 	char *config;
-	for(config = config_file + config_data_offset; (int)(config - config_file) <= (int)config_file_size; ) {
+	for(config = config_file + CONFIG_DATA_OFFSET; (int)(config - config_file) <= (int)config_file_size; ) {
 		// Walk through the configuration file and search by name or EDID
 		unsigned int size = *(unsigned int *)config;
 		char *name = &config[4];
@@ -240,15 +240,8 @@ static int config_handle_output(Display *dpy, XRRScreenResources *resources, RRO
 			unsigned int effective_height = height ? height : output_crtc->height;
 
 			if(output_crtc->width == effective_width && output_crtc->height == effective_height) {
-				unsigned int border;
-				char *tree_start;
-				if(config_has_border_field) {
-					border = *(unsigned int *)&config[4 + 128 + 768 + 4 + 4 + 4];
-					tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;
-				} else {
-					border = 0;
-					tree_start = config + 4 + 128 + 768 + 4 + 4 + 4;
-				}
+				unsigned int border = *(unsigned int *)&config[4 + 128 + 768 + 4 + 4 + 4];
+				char *tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;
 
 				// If it is found and the size matches, add fake outputs/crtcs to the list
 				unsigned n = 0;
@@ -312,22 +305,18 @@ static int open_configuration() {
 		return 1;
 	}
 
-	/* Check for magic header: "FXRD" + uint32 version */
-	if(config_file_size >= 8 && memcmp(config_file, "FXRD", 4) == 0) {
-		unsigned int file_version = *(unsigned int *)(config_file + 4);
-		if(file_version > (unsigned int)_fakexrandr_config_version) {
-			/* Config is newer than this .so understands — pass through */
-			fprintf(stderr, "fakexrandr: config version %u > supported %d, ignoring\n",
-				file_version, _fakexrandr_config_version);
-			close_configuration();
-			return 1;
-		}
-		config_data_offset = 8;
-		config_has_border_field = 1;
-	} else {
-		/* Old headerless format — backwards compatibility */
-		config_data_offset = 0;
-		config_has_border_field = 0;
+	/* Require FXRD magic header */
+	if(config_file_size < 8 || memcmp(config_file, "FXRD", 4) != 0) {
+		fprintf(stderr, "fakexrandr: config missing FXRD header, ignoring\n");
+		close_configuration();
+		return 1;
+	}
+	unsigned int file_version = *(unsigned int *)(config_file + 4);
+	if(file_version > (unsigned int)_fakexrandr_config_version) {
+		fprintf(stderr, "fakexrandr: config version %u > supported %d, ignoring\n",
+			file_version, _fakexrandr_config_version);
+		close_configuration();
+		return 1;
 	}
 
 	return 0;
@@ -758,7 +747,7 @@ static int _get_split_regions_for_output(Display *dpy, const char *output_name,
 	get_output_edid(dpy, output_xid, output_edid);
 
 	char *config;
-	for(config = config_file + config_data_offset; (int)(config - config_file) <= (int)config_file_size; ) {
+	for(config = config_file + CONFIG_DATA_OFFSET; (int)(config - config_file) <= (int)config_file_size; ) {
 		unsigned int size = *(unsigned int *)config;
 		char *name = &config[4];
 		char *edid = &config[4 + 128];
@@ -769,12 +758,7 @@ static int _get_split_regions_for_output(Display *dpy, const char *output_name,
 		int edid_match = (strncmp(edid, output_edid, 768) == 0);
 
 		if(name_match || edid_match) {
-			char *tree_start;
-			if(config_has_border_field) {
-				tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;
-			} else {
-				tree_start = config + 4 + 128 + 768 + 4 + 4 + 4;
-			}
+			char *tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;
 
 			/* Use stored config dimensions (0 = use actual) */
 			*out_config_w = width;

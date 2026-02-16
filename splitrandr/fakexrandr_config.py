@@ -89,6 +89,18 @@ def is_cinnamon_fakexrandr_current():
     if not ondisk_path:
         return False
 
+    # Check if maps shows (deleted) — the .so was replaced on disk
+    pid = _get_cinnamon_pid()
+    if pid:
+        try:
+            with open(f'/proc/{pid}/maps', 'r') as f:
+                for line in f:
+                    if 'fakexrandr' in line and '.so' in line and '(deleted)' in line:
+                        log.info("fakexrandr .so is deleted from disk (stale)")
+                        return False
+        except (OSError, PermissionError):
+            pass
+
     # Check if the loaded file is the same as the on-disk file
     try:
         loaded_stat = os.stat(loaded_path)
@@ -104,19 +116,6 @@ def is_cinnamon_fakexrandr_current():
     if loaded_ver != ondisk_ver:
         log.info("fakexrandr version mismatch: loaded=%d, on-disk=%d", loaded_ver, ondisk_ver)
         return False
-
-    # Same version but different files — could still be stale
-    # Check if the loaded path shows as deleted
-    pid = _get_cinnamon_pid()
-    if pid:
-        try:
-            with open(f'/proc/{pid}/maps', 'r') as f:
-                for line in f:
-                    if 'fakexrandr' in line and '(deleted)' in line:
-                        log.info("fakexrandr .so is deleted from disk (stale)")
-                        return False
-        except (OSError, PermissionError):
-            pass
 
     return True
 
