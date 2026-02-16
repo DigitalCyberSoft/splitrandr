@@ -8,10 +8,6 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
 
-from __future__ import division
-import os
-import stat
-
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('PangoCairo', '1.0')
@@ -142,10 +138,9 @@ class _MonitorIdentifier(Gtk.Window):
         return True
 
 
-class ARandRWidget(Gtk.DrawingArea):
+class MonitorWidget(Gtk.DrawingArea):
 
     sequence = None
-    _lastclick = None
     _draggingoutput = None
     _draggingfrom = None
     _draggingsnap = None
@@ -172,7 +167,7 @@ class ARandRWidget(Gtk.DrawingArea):
             self._show_monitor_indicator(name)
 
     def __init__(self, window, factor=8, display=None, force_version=False):
-        super(ARandRWidget, self).__init__()
+        super(MonitorWidget, self).__init__()
 
         self.window = window
         self._factor = factor
@@ -295,20 +290,12 @@ class ARandRWidget(Gtk.DrawingArea):
 
     #################### loading ####################
 
-    def load_from_file(self, file):
-        data = open(file).read()
-        template = self._xrandr.load_from_string(data)
-        self._xrandr_was_reloaded()
-        return template
-
     def load_from_x(self):
         self._xrandr.load_from_x()
         self._xrandr_was_reloaded()
-        return self._xrandr.DEFAULTTEMPLATE
 
     def _xrandr_was_reloaded(self):
         self.sequence = sorted(self._xrandr.outputs)
-        self._lastclick = (-1, -1)
 
         # Validate selection
         active_outputs = [
@@ -333,12 +320,6 @@ class ARandRWidget(Gtk.DrawingArea):
     def save_to_x(self):
         self._xrandr.save_to_x()
         self.load_from_x()
-
-    def save_to_file(self, file, template=None, additional=None):
-        data = self._xrandr.save_to_shellscript_string(template, additional)
-        open(file, 'w').write(data)
-        os.chmod(file, stat.S_IRWXU)
-        self.load_from_file(file)
 
     #################### doing changes ####################
 
@@ -621,16 +602,10 @@ class ARandRWidget(Gtk.DrawingArea):
         undermouse = self._get_point_outputs(event.x, event.y)
         if event.button == 1 and undermouse:
             which = self._get_point_active_output(event.x, event.y)
-            if self._lastclick == (event.x, event.y):
-                newpos = min(self.sequence.index(a) for a in undermouse)
-                self.sequence.remove(which)
-                self.sequence.insert(newpos, which)
-                which = self._get_point_active_output(event.x, event.y)
             self.sequence.remove(which)
             self.sequence.append(which)
 
             self.selected_output = which
-            self._lastclick = (event.x, event.y)
             self._force_repaint()
         elif event.button == 1 and not undermouse:
             self.selected_output = None

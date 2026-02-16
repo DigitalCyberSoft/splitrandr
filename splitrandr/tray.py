@@ -157,6 +157,7 @@ class SplitRandRTray:
 
         Returns True if the user kept changes, False if reverted.
         """
+        import os
         COUNTDOWN = 30
         state = {'remaining': COUNTDOWN, 'timer_id': None}
 
@@ -191,6 +192,13 @@ class SplitRandRTray:
         dialog.destroy()
 
         if response != Gtk.ResponseType.ACCEPT:
+            # Clear fakexrandr config so xrandr sees real physical outputs
+            try:
+                from .fakexrandr_config import CONFIG_PATH
+                if os.path.exists(CONFIG_PATH):
+                    os.remove(CONFIG_PATH)
+            except Exception:
+                pass
             subprocess.Popen(['sh', '-c', revert_script])
             profiles.set_active_profile(previous_active)
             return False

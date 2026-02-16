@@ -11,7 +11,6 @@
 import math
 import os
 import optparse
-import stat
 
 import subprocess
 
@@ -31,10 +30,10 @@ from .meta import (
 
 class Application:
 
-    AUTOSTART_SCRIPT = os.path.expanduser('~/.config/splitrandr/layout.sh')
+    LAYOUT_JSON = os.path.expanduser('~/.config/splitrandr/layout.json')
     AUTOSTART_DESKTOP = os.path.expanduser('~/.config/autostart/splitrandr.desktop')
 
-    def __init__(self, file=None, randr_display=None, force_version=False):
+    def __init__(self, randr_display=None, force_version=False):
         self.window = window = Gtk.Window()
         window.props.title = _("Display")
         window.connect('delete-event', self._on_delete_event)
@@ -50,14 +49,11 @@ class Application:
         window.add_accel_group(accel)
 
         # Widget
-        self.widget = widget.ARandRWidget(
+        self.widget = widget.MonitorWidget(
             display=randr_display, force_version=force_version,
             window=self.window
         )
-        if file is None:
-            self.filetemplate = self.widget.load_from_x()
-        else:
-            self.filetemplate = self.widget.load_from_file(file)
+        self.widget.load_from_x()
 
         self.widget.connect('selection-changed', self._on_selection_changed)
         self.widget.connect('changed', self._on_widget_changed)
@@ -248,7 +244,7 @@ class Application:
 
         settings_box.pack_start(prof_row, False, False, 0)
 
-        # Tray + Zoom + Layout Files row (compact)
+        # Tray + Zoom row
         misc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
 
         # Tray switch
@@ -280,24 +276,6 @@ class Application:
             self._zoom_radios[val] = rb
             prev = rb
         misc_row.pack_start(zoom_sub, False, False, 0)
-
-        # Layout file buttons
-        files_sub = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        files_sub.pack_start(Gtk.Label(label=_("Layout:")), False, False, 0)
-
-        new_btn = Gtk.Button(label=_("New"))
-        new_btn.connect('clicked', lambda b: self.do_new())
-        files_sub.pack_start(new_btn, False, False, 0)
-
-        open_btn = Gtk.Button(label=_("Open..."))
-        open_btn.connect('clicked', lambda b: self.do_open())
-        files_sub.pack_start(open_btn, False, False, 0)
-
-        save_as_btn = Gtk.Button(label=_("Save As..."))
-        save_as_btn.connect('clicked', lambda b: self.do_save_as())
-        files_sub.pack_start(save_as_btn, False, False, 0)
-
-        misc_row.pack_start(files_sub, False, False, 0)
 
         settings_box.pack_start(misc_row, False, False, 0)
 
@@ -610,10 +588,10 @@ class Application:
         self.widget._force_repaint()
 
     def _on_detect_displays(self):
-        self.filetemplate = self.widget.load_from_x()
+        self.widget.load_from_x()
 
     def _on_reset_defaults(self):
-        self.filetemplate = self.widget.load_from_x()
+        self.widget.load_from_x()
 
     #################### apply / revert ####################
 
@@ -737,27 +715,29 @@ class Application:
         if not self._confirm_or_revert(revert_script):
             return
 
-        script_dir = os.path.dirname(self.AUTOSTART_SCRIPT)
-        os.makedirs(script_dir, exist_ok=True)
-        self.widget.save_to_file(self.AUTOSTART_SCRIPT, self.filetemplate)
+        # Save layout as JSON
+        self.widget._xrandr.save_to_json(self.LAYOUT_JSON)
 
+        # Update active profile
         active = profiles.get_active_profile()
         if active:
-            script = self.widget._xrandr.save_to_shellscript_string(
-                self.filetemplate)
-            profiles.save_profile(active, script)
+            profiles.save_profile(active,
+                                  self.widget._xrandr.configuration.to_dict())
 
+        # Write autostart .desktop pointing at --apply
         autostart_dir = os.path.dirname(self.AUTOSTART_DESKTOP)
         os.makedirs(autostart_dir, exist_ok=True)
 
+        import sys
+        python = sys.executable or 'python3'
         desktop_entry = (
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=SplitRandR Layout\n"
             "Comment=Restore monitor layout and virtual splits\n"
-            "Exec=%s\n"
+            "Exec=%s -m splitrandr --apply\n"
             "X-GNOME-Autostart-enabled=true\n"
-        ) % self.AUTOSTART_SCRIPT
+        ) % python
 
         with open(self.AUTOSTART_DESKTOP, 'w') as f:
             f.write(desktop_entry)
@@ -766,64 +746,11 @@ class Application:
             None, Gtk.DialogFlags.MODAL, Gtk.MessageType.INFO,
             Gtk.ButtonsType.OK,
             _("Layout applied and saved for autostart.\n\n"
-              "Script: %s\n"
-              "Autostart: %s") % (self.AUTOSTART_SCRIPT, self.AUTOSTART_DESKTOP)
+              "Config: %s\n"
+              "Autostart: %s") % (self.LAYOUT_JSON, self.AUTOSTART_DESKTOP)
         )
         dialog.run()
         dialog.destroy()
-
-    #################### layout file operations ####################
-
-    def do_new(self):
-        self.filetemplate = self.widget.load_from_x()
-
-    def do_open(self):
-        dialog = self._new_file_dialog(
-            _("Open Layout"), Gtk.FileChooserAction.OPEN, _("Open")
-        )
-
-        result = dialog.run()
-        filenames = dialog.get_filenames()
-        dialog.destroy()
-        if result == Gtk.ResponseType.ACCEPT:
-            assert len(filenames) == 1
-            filename = filenames[0]
-            self.filetemplate = self.widget.load_from_file(filename)
-
-    def do_save_as(self):
-        dialog = self._new_file_dialog(
-            _("Save Layout"), Gtk.FileChooserAction.SAVE, _("Save")
-        )
-        dialog.props.do_overwrite_confirmation = True
-
-        result = dialog.run()
-        filenames = dialog.get_filenames()
-        dialog.destroy()
-        if result == Gtk.ResponseType.ACCEPT:
-            assert len(filenames) == 1
-            filename = filenames[0]
-            if not filename.endswith('.sh'):
-                filename = filename + '.sh'
-            self.widget.save_to_file(filename, self.filetemplate)
-
-    def _new_file_dialog(self, title, dialog_type, buttonlabel):
-        dialog = Gtk.FileChooserDialog(title, None, dialog_type)
-        dialog.add_button(_("Cancel"), Gtk.ResponseType.CANCEL)
-        dialog.add_button(buttonlabel, Gtk.ResponseType.ACCEPT)
-
-        layoutdir = os.path.expanduser('~/.screenlayout/')
-        try:
-            os.makedirs(layoutdir)
-        except OSError:
-            pass
-        dialog.set_current_folder(layoutdir)
-
-        file_filter = Gtk.FileFilter()
-        file_filter.set_name('Shell script (Layout file)')
-        file_filter.add_pattern('*.sh')
-        dialog.add_filter(file_filter)
-
-        return dialog
 
     #################### profiles & tray ####################
 
@@ -875,9 +802,8 @@ class Application:
         if dialog.run() == Gtk.ResponseType.ACCEPT:
             name = entry.get_text().strip()
             if name:
-                script = self.widget._xrandr.save_to_shellscript_string(
-                    self.filetemplate)
-                profiles.save_profile(name, script)
+                profiles.save_profile(name,
+                                      self.widget._xrandr.configuration.to_dict())
                 profiles.set_active_profile(name)
                 self._populate_profiles_combo()
                 self._notify_tray()
@@ -886,7 +812,8 @@ class Application:
     def _do_load_profile(self, name):
         path = profiles.profile_path(name)
         if os.path.exists(path):
-            self.filetemplate = self.widget.load_from_file(path)
+            self.widget._xrandr.load_from_json(path)
+            self.widget._xrandr_was_reloaded()
             profiles.set_active_profile(name)
             self._populate_profiles_combo()
             self._notify_tray()
@@ -972,7 +899,6 @@ def main():
     )
 
     parser = optparse.OptionParser(
-        usage="%prog [savedfile]",
         description="Monitor Layout Editor with Virtual Monitor Splitting",
         version="%%prog %s" % __version__
     )
@@ -991,8 +917,13 @@ def main():
         action='store_true'
     )
     parser.add_option(
+        '--apply',
+        help='Apply layout from JSON config (default: ~/.config/splitrandr/layout.json), then exit',
+        action='store_true'
+    )
+    parser.add_option(
         '--regenerate',
-        help='Regenerate autostart script and active profile from current X state, then exit',
+        help='Regenerate autostart config and active profile from current X state, then exit',
         action='store_true'
     )
     parser.add_option(
@@ -1003,66 +934,70 @@ def main():
 
     (options, args) = parser.parse_args()
 
+    if options.apply:
+        json_path = args[0] if args else Application.LAYOUT_JSON
+        _apply_config(json_path)
+        return
+
     if options.regenerate:
-        _regenerate_scripts()
+        _regenerate_config()
         return
 
     if options.update_configs:
         _update_configs()
         return
 
-    if not args:
-        file_to_open = None
-    elif len(args) == 1:
-        file_to_open = args[0]
-    else:
-        parser.usage()
-
     app = Application(
-        file=file_to_open,
         randr_display=options.randr_display,
         force_version=options.force_version
     )
     app.run()
 
 
-def _regenerate_scripts():
-    """Regenerate autostart script and active profile from current X state."""
+def _apply_config(json_path):
+    """Load layout from JSON and apply via save_to_x()."""
+    from .xrandr import XRandR
+
+    if not os.path.exists(json_path):
+        print("Error: config file not found: %s" % json_path)
+        return
+
+    xrandr = XRandR(force_version=True)
+    xrandr.load_from_x()
+    xrandr.load_from_json(json_path)
+    xrandr.save_to_x()
+    print("Applied config from %s" % json_path)
+
+
+def _regenerate_config():
+    """Regenerate autostart config and active profile from current X state."""
     from .xrandr import XRandR
 
     xrandr = XRandR(force_version=True)
     xrandr.load_from_x()
 
-    # Preserve pre-commands (e.g. xset -dpms) from the existing autostart script
-    autostart_path = Application.AUTOSTART_SCRIPT
-    if os.path.exists(autostart_path):
+    # Preserve pre-commands from existing JSON config if present
+    json_path = Application.LAYOUT_JSON
+    if os.path.exists(json_path):
         try:
-            existing = open(autostart_path).read()
-            pre_cmds = []
-            for line in existing.split('\n'):
-                stripped = line.strip()
-                if stripped.startswith('xset '):
-                    pre_cmds.append(stripped)
+            import json
+            with open(json_path) as f:
+                existing = json.load(f)
+            pre_cmds = existing.get('pre_commands', [])
             if pre_cmds:
                 xrandr.configuration._pre_commands = pre_cmds
         except Exception:
             pass
 
-    script = xrandr.save_to_shellscript_string()
-
-    # Regenerate autostart script
-    autostart_dir = os.path.dirname(autostart_path)
-    os.makedirs(autostart_dir, exist_ok=True)
-    with open(autostart_path, 'w') as f:
-        f.write(script)
-    os.chmod(autostart_path, os.stat(autostart_path).st_mode | stat.S_IEXEC)
-    print("Updated autostart: %s" % autostart_path)
+    # Save layout as JSON
+    xrandr.save_to_json(json_path)
+    print("Updated autostart config: %s" % json_path)
 
     # Regenerate active profile
     from . import profiles
     active = profiles.get_active_profile()
     if active:
-        profiles.save_profile(active, script)
+        profiles.save_profile(active, xrandr.configuration.to_dict())
         print("Updated profile: %s" % active)
     else:
         print("No active profile to update")
@@ -1091,22 +1026,17 @@ def _update_configs():
     xrandr = XRandR(force_version=True)
     xrandr.load_from_x()
 
-    # Try to load borders from the autostart script if it exists
+    # Try to load borders from the JSON config if it exists
     borders = xrandr.configuration.borders
-    autostart = Application.AUTOSTART_SCRIPT
-    if not borders and os.path.exists(autostart):
+    json_path = Application.LAYOUT_JSON
+    if not borders and os.path.exists(json_path):
         try:
-            with open(autostart) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('# splitrandr-border:'):
-                        spec = line[len('# splitrandr-border:'):]
-                        if '=' in spec:
-                            bname, bval = spec.split('=', 1)
-                            try:
-                                borders[bname] = int(bval)
-                            except ValueError:
-                                pass
+            import json
+            with open(json_path) as f:
+                data = json.load(f)
+            for bname, bval in data.get('borders', {}).items():
+                if isinstance(bval, int) and bval > 0:
+                    borders[bname] = bval
         except Exception:
             pass
 

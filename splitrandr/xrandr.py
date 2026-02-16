@@ -8,6 +8,7 @@
 
 """Wrapper around command line xrandr with --setmonitor support"""
 
+import json
 import os
 import re
 import subprocess
@@ -18,15 +19,11 @@ from functools import reduce
 log = logging.getLogger('splitrandr')
 
 from .auxiliary import (
-    BetterList, Size, Position, Geometry, FileLoadError, FileSyntaxError,
+    Size, Position, Geometry,
     InadequateConfiguration, Rotation, ROTATIONS, NORMAL, NamedSize,
-    MonitorGeometry,
 )
 from .splits import SplitTree
 from .i18n import _
-
-SHELLSHEBANG = '#!/bin/sh'
-
 
 def _restart_sn_watcher():
     """Restart xapp-sn-watcher so it picks up the new monitor layout.
@@ -52,8 +49,6 @@ class Feature:
 
 
 class XRandR:
-    DEFAULTTEMPLATE = [SHELLSHEBANG, '%(pre_commands)s', '%(clear_fakexrandr)s', '%(xrandr)s', '%(cinnamon_safe_setmonitors)s']
-
     configuration = None
     state = None
 
@@ -126,6 +121,60 @@ class XRandR:
             log.error("xrandr (no-preload) exit %d stderr: %s", status, err.decode('utf-8', errors='replace'))
             raise Exception("XRandR returned error code %d: %s" % (status, err))
 
+    def _refresh_edids(self):
+        """Re-read EDIDs from the X server and update state.
+
+        Must be called when fakexrandr.bin is cleared (pass-through mode)
+        so that real physical outputs are visible with their EDIDs.
+        Virtual outputs created by fakexrandr have no EDID, so if we
+        loaded state while fakexrandr was active, EDIDs will be empty.
+        """
+        try:
+            verbose = self._output("--verbose")
+        except Exception:
+            return
+        current_output = None
+        in_edid = False
+        edid_lines = []
+        for line in verbose.split('\n'):
+            if not line.startswith(('\t', ' ')):
+                # Flush pending EDID
+                if in_edid and current_output and edid_lines:
+                    edid_hex = ''.join(edid_lines)
+                    out_state = self.state.outputs.get(current_output)
+                    if out_state and not out_state.edid_hex:
+                        out_state.edid_hex = edid_hex
+                in_edid = False
+                edid_lines = []
+                # Parse output name from headline
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ('connected', 'disconnected', 'unknown'):
+                    current_output = parts[0]
+                else:
+                    current_output = None
+            elif line.startswith('\t'):
+                stripped = line.strip()
+                if stripped == 'EDID:':
+                    in_edid = True
+                    edid_lines = []
+                elif in_edid:
+                    if re.match(r'^[0-9a-f]+$', stripped):
+                        edid_lines.append(stripped)
+                    else:
+                        if current_output and edid_lines:
+                            edid_hex = ''.join(edid_lines)
+                            out_state = self.state.outputs.get(current_output)
+                            if out_state and not out_state.edid_hex:
+                                out_state.edid_hex = edid_hex
+                        in_edid = False
+                        edid_lines = []
+        # Flush final EDID
+        if in_edid and current_output and edid_lines:
+            edid_hex = ''.join(edid_lines)
+            out_state = self.state.outputs.get(current_output)
+            if out_state and not out_state.edid_hex:
+                out_state.edid_hex = edid_hex
+
     def _run_no_preload_ignore_error(self, *args):
         """Run xrandr with LD_PRELOAD stripped, ignoring errors."""
         env = {k: v for k, v in self.environ.items() if k != 'LD_PRELOAD'}
@@ -141,224 +190,13 @@ class XRandR:
 
     #################### loading ####################
 
-    def load_from_string(self, data):
-        data = data.replace("%", "%%")
-        lines = data.split("\n")
-        if lines[-1] == '':
-            lines.pop()
-
-        if lines[0] != SHELLSHEBANG:
-            raise FileLoadError('Not a shell script.')
-
-        xrandrlines = [i for i, l in enumerate(
-            lines) if l.strip().startswith('xrandr ') or
-            'xrandr ' in l.strip()]
-        if not xrandrlines:
-            raise FileLoadError('No recognized xrandr command in this shell script.')
-
-        # Find the main xrandr --output line (has --output in it)
-        main_line_idx = None
-        setmonitor_idxs = []
-        delmonitor_idxs = []
-        for idx in xrandrlines:
-            line = lines[idx].strip()
-            if '--setmonitor' in line:
-                setmonitor_idxs.append(idx)
-            elif '--delmonitor' in line:
-                delmonitor_idxs.append(idx)
-            elif '--output' in line:
-                if main_line_idx is not None:
-                    raise FileLoadError('More than one xrandr --output line in this shell script.')
-                main_line_idx = idx
-
-        if main_line_idx is None:
-            raise FileLoadError('No xrandr --output line found in this shell script.')
-
-        self._load_from_commandlineargs(lines[main_line_idx].strip())
-        lines[main_line_idx] = '%(xrandr)s'
-
-        # Parse --setmonitor lines to reconstruct splits
-        self._load_splits_from_setmonitor_lines(
-            [lines[i].strip() for i in setmonitor_idxs])
-
-        # Parse border comments (# splitrandr-border:OUTPUT=N)
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('# splitrandr-border:'):
-                border_spec = stripped[len('# splitrandr-border:'):]
-                if '=' in border_spec:
-                    bname, bval = border_spec.split('=', 1)
-                    try:
-                        self.configuration.borders[bname] = int(bval)
-                    except ValueError:
-                        pass
-
-        # Remove setmonitor/delmonitor lines and Cinnamon-safety wrapper lines
-        cinnamon_wrapper_patterns = [
-            'CINNAMON_PID=', 'pgrep -x cinnamon',
-            'gsettings set org.cinnamon.settings-daemon.plugins.xrandr',
-            'kill -STOP "$CINNAMON_PID"', 'kill -CONT "$CINNAMON_PID"',
-            'if [ -n "$CINNAMON_PID" ]', 'sleep 0.', 'fi',
-            '# Cinnamon safety',
-            # Readiness polling constructs (replacing blind sleeps)
-            'gsettings get', '_i=0', '_v=$(', 'done',
-            'xrandr --listmonitors >/dev/null',
-            '# Wait for gsettings', '# X server round-trip',
-            # fakexrandr config clearing
-            'fakexrandr.bin',
-            # border config comments
-            'splitrandr-border:',
-        ]
-        removal_idxs = set(setmonitor_idxs + delmonitor_idxs)
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if any(pat in stripped for pat in cinnamon_wrapper_patterns):
-                removal_idxs.add(i)
-        for idx in sorted(removal_idxs, reverse=True):
-            if idx < len(lines) and lines[idx] != '%(xrandr)s':
-                lines.pop(idx)
-
-        # Collect pre-commands (e.g. xset -dpms) and replace with marker
-        pre_cmd_idxs = []
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith('xset '):
-                pre_cmd_idxs.append(i)
-        if pre_cmd_idxs:
-            # Store them in configuration for re-emission
-            self.configuration._pre_commands = [lines[i].strip() for i in pre_cmd_idxs]
-            for idx in sorted(pre_cmd_idxs, reverse=True):
-                lines.pop(idx)
-        else:
-            self.configuration._pre_commands = []
-
-        # Ensure template has all required markers
-        xrandr_idx = lines.index('%(xrandr)s')
-        if '%(cinnamon_safe_setmonitors)s' not in lines:
-            lines.insert(xrandr_idx + 1, '%(cinnamon_safe_setmonitors)s')
-        if '%(clear_fakexrandr)s' not in lines:
-            xrandr_idx = lines.index('%(xrandr)s')
-            lines.insert(xrandr_idx, '%(clear_fakexrandr)s')
-        if '%(pre_commands)s' not in lines:
-            # Insert before clear_fakexrandr
-            clear_idx = lines.index('%(clear_fakexrandr)s')
-            lines.insert(clear_idx, '%(pre_commands)s')
-
-        return lines
-
-    def _load_splits_from_setmonitor_lines(self, setmonitor_lines):
-        """Parse xrandr --setmonitor lines and reconstruct SplitTree for each output."""
-        # Group by base output name
-        monitors_by_output = {}
-        for line in setmonitor_lines:
-            # xrandr --setmonitor NAME WIDTHpx/WIDTHmm x HEIGHTpx/HEIGHTmm + X + Y OUTPUT
-            # or: env -u LD_PRELOAD xrandr --setmonitor NAME W/Wmm*H/Hmm+X+Y OUTPUT
-            parts = line.split()
-            # Find 'xrandr' '--setmonitor' in the parts (may be prefixed by env -u LD_PRELOAD)
-            try:
-                xr_idx = parts.index('xrandr')
-            except ValueError:
-                continue
-            if xr_idx + 1 >= len(parts) or parts[xr_idx + 1] != '--setmonitor':
-                continue
-            if xr_idx + 4 > len(parts):
-                continue
-
-            mon_name = parts[xr_idx + 2]
-            geom_str = parts[xr_idx + 3]
-            output = parts[xr_idx + 4] if xr_idx + 4 < len(parts) else 'none'
-
-            # Parse monitor name: OUTPUT~INDEX
-            if '~' not in mon_name:
-                continue
-            base_output = mon_name.rsplit('~', 1)[0]
-
-            # Parse geometry: W/Wmm x H/Hmm + X + Y
-            # Format: "1920/605x2160/680+0+0"
-            m = re.match(r'(\d+)/(\d+)x(\d+)/(\d+)\+(\d+)\+(\d+)', geom_str)
-            if not m:
-                continue
-
-            w, w_mm, h, h_mm, x, y = [int(g) for g in m.groups()]
-
-            if base_output not in monitors_by_output:
-                monitors_by_output[base_output] = []
-            monitors_by_output[base_output].append((x, y, w, h))
-
-        # Reconstruct split trees
-        for output_name, regions in monitors_by_output.items():
-            if output_name not in self.configuration.outputs:
-                continue
-            output_cfg = self.configuration.outputs[output_name]
-            if not output_cfg.active:
-                continue
-
-            total_w = output_cfg.size[0]
-            total_h = output_cfg.size[1]
-
-            # Normalize regions relative to output position
-            ox, oy = output_cfg.position
-            normalized = [(r[0] - ox, r[1] - oy, r[2], r[3]) for r in regions]
-
-            tree = SplitTree.from_setmonitor_regions(normalized, output_name, total_w, total_h)
-            if not tree.is_leaf:
-                self.configuration.splits[output_name] = tree
-
-    def _load_from_commandlineargs(self, commandline):
-        self.load_from_x()
-
-        args = BetterList(commandline.split(" "))
-        if args.pop(0) != 'xrandr':
-            raise FileSyntaxError()
-        options = dict((a[0], a[1:]) for a in args.split('--output') if a)
-
-        for output_name, output_argument in options.items():
-            output = self.configuration.outputs[output_name]
-            output_state = self.state.outputs[output_name]
-            output.primary = False
-            if output_argument == ['--off']:
-                output.active = False
-            else:
-                if '--primary' in output_argument:
-                    if Feature.PRIMARY in self.features:
-                        output.primary = True
-                    output_argument.remove('--primary')
-                if len(output_argument) % 2 != 0:
-                    raise FileSyntaxError()
-                parts = [
-                    (output_argument[2 * i], output_argument[2 * i + 1])
-                    for i in range(len(output_argument) // 2)
-                ]
-                pending_rate = None
-                for part in parts:
-                    if part[0] == '--mode':
-                        for namedmode in output_state.modes:
-                            if namedmode.name == part[1]:
-                                output.mode = namedmode
-                                break
-                        else:
-                            raise FileLoadError("Not a known mode: %s" % part[1])
-                    elif part[0] == '--rate':
-                        pending_rate = float(part[1])
-                    elif part[0] == '--pos':
-                        output.position = Position(part[1])
-                    elif part[0] == '--rotate':
-                        if part[1] not in ROTATIONS:
-                            raise FileSyntaxError()
-                        output.rotation = Rotation(part[1])
-                    else:
-                        raise FileSyntaxError()
-                # If a rate was specified, try to find the exact mode with that rate
-                if pending_rate is not None and hasattr(output, 'mode'):
-                    for namedmode in output_state.modes:
-                        if namedmode.name == output.mode.name and namedmode.refresh_rate is not None:
-                            if abs(namedmode.refresh_rate - pending_rate) < 0.1:
-                                output.mode = namedmode
-                                break
-                output.active = True
-
     def load_from_x(self):
+        # Preserve borders across reloads — borders are set by the user
+        # and not discoverable from the X server state alone.
+        old_borders = getattr(self, 'configuration', None)
+        old_borders = old_borders.borders if old_borders else {}
         self.configuration = self.Configuration(self)
+        self.configuration.borders = dict(old_borders)
         self.state = self.State()
 
         screenline, items = self._load_raw_lines()
@@ -731,10 +569,8 @@ class XRandR:
 
     #################### saving ####################
 
-    def save_to_shellscript_string(self, template=None, additional=None):
-        if not template:
-            template = self.DEFAULTTEMPLATE
-        template = '\n'.join(template) + '\n'
+    def save_to_shellscript_string(self):
+        template = '#!/bin/sh\n%(pre_commands)s\n%(clear_fakexrandr)s\n%(xrandr)s\n%(cinnamon_safe_setmonitors)s\n'
 
         # Build delmonitor + setmonitor commands
         del_lines = []
@@ -831,9 +667,6 @@ class XRandR:
             'setmonitors': '\n'.join(set_lines),
             'cinnamon_safe_setmonitors': cinnamon_safe,
         }
-        if additional:
-            data.update(additional)
-
         result = template % data
         # Clean up empty lines from unused template markers
         result = '\n'.join(line for line in result.split('\n') if line.strip() != '') + '\n'
@@ -870,6 +703,11 @@ class XRandR:
         # Apply main configuration (before any setmonitor calls)
         log.info("applying main xrandr config")
         self._run(*self.configuration.commandlineargs())
+
+        # Refresh EDIDs while fakexrandr is in pass-through mode.
+        # When loaded with fakexrandr active, virtual outputs have no EDID.
+        # Now that fakexrandr.bin is cleared, real outputs are visible.
+        self._refresh_edids()
 
         # Wrap delmonitor + setmonitor in Cinnamon safety guard.
         # Muffin >= 5.4.0 segfaults on setmonitor events, so we
@@ -933,8 +771,9 @@ class XRandR:
                 log.info("creating border setmonitor for unsplit %s: %s %s", output_name, mon_name, geom)
                 self._run_no_preload("--setmonitor", mon_name, geom, output_name)
 
-            # Write fakexrandr config BEFORE Cinnamon resumes, so it
-            # reads the new config when it processes the queued RandR events.
+            # Write fakexrandr config and monitors.xml BEFORE Cinnamon
+            # resumes, so it reads the new config when it processes the
+            # queued RandR events.
             try:
                 from .fakexrandr_config import write_fakexrandr_config
                 write_fakexrandr_config(
@@ -943,6 +782,14 @@ class XRandR:
                 )
             except Exception as e:
                 log.warning("fakexrandr config write failed: %s", e)
+            try:
+                from .fakexrandr_config import write_cinnamon_monitors_xml
+                write_cinnamon_monitors_xml(
+                    self.configuration.splits, self.state, self.configuration,
+                    self.configuration.borders
+                )
+            except Exception as e:
+                log.warning("monitors.xml write failed: %s", e)
 
         # Verify result
         try:
@@ -956,7 +803,8 @@ class XRandR:
         # monitors.xml on startup which clobbers our layout).
         try:
             from .fakexrandr_config import (
-                is_cinnamon_fakexrandr_loaded, _find_fakexrandr_lib,
+                is_cinnamon_fakexrandr_loaded, is_cinnamon_fakexrandr_current,
+                _find_fakexrandr_lib,
                 restart_cinnamon_with_fakexrandr, restart_cinnamon_without_fakexrandr,
                 write_cinnamon_monitors_xml,
             )
@@ -965,17 +813,7 @@ class XRandR:
                 for tree in self.configuration.splits.values()
             )
 
-            # Always write monitors.xml so Muffin preserves our
-            # display settings (positions, modes, primary) on restart.
-            try:
-                write_cinnamon_monitors_xml(
-                    self.configuration.splits, self.state, self.configuration,
-                    self.configuration.borders
-                )
-            except Exception as e:
-                log.warning("monitors.xml write failed: %s", e)
-
-            if has_splits and not is_cinnamon_fakexrandr_loaded():
+            if has_splits and not is_cinnamon_fakexrandr_current():
                 lib_path = _find_fakexrandr_lib()
                 if lib_path:
                     log.info("Cinnamon doesn't have fakexrandr loaded, restarting")
@@ -1065,6 +903,25 @@ class XRandR:
         _restart_sn_watcher()
 
         log.info("=== save_to_x: done ===")
+
+    def save_to_json(self, path):
+        data = self.configuration.to_dict()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+
+    def load_from_json(self, path):
+        with open(path, 'r') as f:
+            data = json.load(f)
+        # Merge saved config onto current live state
+        saved_cfg = self.Configuration.from_dict(data, self)
+        for name, saved_out in saved_cfg.outputs.items():
+            if name in self.configuration.outputs:
+                self.configuration.outputs[name] = saved_out
+        self.configuration.splits = saved_cfg.splits
+        self.configuration.borders = saved_cfg.borders
+        self.configuration._pre_commands = getattr(saved_cfg, '_pre_commands', [])
 
     def check_configuration(self):
         vmax = self.state.virtual.max
@@ -1175,6 +1032,84 @@ class XRandR:
                     args.append("--rotate")
                     args.append(output.rotation)
             return args
+
+        def to_dict(self):
+            outputs = {}
+            for name, out in self.outputs.items():
+                d = {'active': out.active, 'primary': out.primary}
+                if out.active:
+                    d['mode'] = out.mode.name
+                    d['refresh_rate'] = out.mode.refresh_rate
+                    d['position'] = list(out.position)
+                    d['rotation'] = str(out.rotation)
+                outputs[name] = d
+            splits = {}
+            for name, tree in self.splits.items():
+                splits[name] = tree.to_dict()
+            return {
+                'outputs': outputs,
+                'splits': splits,
+                'borders': dict(self.borders),
+                'pre_commands': getattr(self, '_pre_commands', []),
+            }
+
+        @classmethod
+        def from_dict(cls, data, xrandr):
+            cfg = cls(xrandr)
+            for name, out_data in data.get('outputs', {}).items():
+                active = out_data['active']
+                primary = out_data.get('primary', False)
+                if active:
+                    mode_name = out_data['mode']
+                    refresh_rate = out_data.get('refresh_rate')
+                    pos = out_data['position']
+                    rotation = Rotation(out_data.get('rotation', 'normal'))
+                    # Find mode from state if available
+                    mode = None
+                    state_out = xrandr.state.outputs.get(name) if xrandr.state else None
+                    if state_out:
+                        for m in state_out.modes:
+                            if m.name == mode_name:
+                                if refresh_rate is not None and m.refresh_rate is not None:
+                                    if abs(m.refresh_rate - refresh_rate) < 0.1:
+                                        mode = m
+                                        break
+                                elif mode is None:
+                                    mode = m
+                    if mode is None:
+                        # Parse resolution from mode name (e.g. "3840x2160")
+                        parts = mode_name.split('x')
+                        if len(parts) == 2:
+                            try:
+                                w, h = int(parts[0]), int(parts[1])
+                                mode = NamedSize(Size([w, h]), name=mode_name,
+                                                 refresh_rate=refresh_rate)
+                            except ValueError:
+                                mode = NamedSize(Size([1920, 1080]), name=mode_name,
+                                                 refresh_rate=refresh_rate)
+                        else:
+                            mode = NamedSize(Size([1920, 1080]), name=mode_name,
+                                             refresh_rate=refresh_rate)
+                    geometry = Geometry(mode[0], mode[1], pos[0], pos[1])
+                    if rotation.is_odd:
+                        geometry = Geometry(mode[1], mode[0], pos[0], pos[1])
+                    oc = cls.OutputConfiguration(
+                        active=True, primary=primary,
+                        geometry=geometry, rotation=rotation,
+                        modename=mode_name, refresh_rate=refresh_rate,
+                    )
+                else:
+                    oc = cls.OutputConfiguration(
+                        active=False, primary=False,
+                        geometry=None, rotation=None,
+                        modename=None, refresh_rate=None,
+                    )
+                cfg.outputs[name] = oc
+            for name, tree_data in data.get('splits', {}).items():
+                cfg.splits[name] = SplitTree.from_dict(tree_data)
+            cfg.borders = data.get('borders', {})
+            cfg._pre_commands = data.get('pre_commands', [])
+            return cfg
 
         class OutputConfiguration:
 

@@ -11,9 +11,14 @@ import os
 import struct
 import subprocess
 import logging
+import ctypes
 import xml.etree.ElementTree as ET
 
 log = logging.getLogger('splitrandr')
+
+# Must match _fakexrandr_config_version in libXrandr.c
+FAKEXRANDR_CONFIG_VERSION = 1
+FAKEXRANDR_CONFIG_MAGIC = b"FXRD"
 
 
 def _get_cinnamon_pid():
@@ -34,19 +39,92 @@ def _get_cinnamon_pid():
 
 def is_cinnamon_fakexrandr_loaded():
     """Check if the running Cinnamon process has fakexrandr loaded."""
+    return _get_cinnamon_fakexrandr_path() is not None
+
+
+def _get_so_config_version(lib_path):
+    """Read _fakexrandr_config_version from a .so file via ctypes.
+
+    Returns the version int, or 0 if the symbol is missing (old .so).
+    """
+    try:
+        lib = ctypes.CDLL(lib_path)
+        ver = ctypes.c_int.in_dll(lib, '_fakexrandr_config_version')
+        return ver.value
+    except (OSError, ValueError):
+        return 0
+
+
+def _get_cinnamon_fakexrandr_path():
+    """Find the fakexrandr .so path loaded in Cinnamon's process.
+
+    Reads /proc/PID/maps for the cinnamon process and looks for a
+    mapped fakexrandr library. Returns the on-disk path or None.
+    """
     pid = _get_cinnamon_pid()
     if not pid:
-        return False
+        return None
     try:
         with open(f'/proc/{pid}/maps', 'r') as f:
             for line in f:
-                if 'fakexrandr' in line.lower() or 'libXrandr.so' in line:
-                    # Check it's our fakexrandr, not the real libXrandr
-                    if 'fakexrandr' in line:
-                        return True
+                if 'fakexrandr' not in line:
+                    continue
+                # Format: addr perms offset dev inode path
+                parts = line.split()
+                if len(parts) >= 6:
+                    path = parts[5]
+                    # The path may end with " (deleted)" if .so was replaced
+                    if path.endswith('(deleted)'):
+                        path = path.rsplit(' ', 1)[0].strip()
+                    return path
     except (OSError, PermissionError):
         pass
-    return False
+    return None
+
+
+def is_cinnamon_fakexrandr_current():
+    """Check if Cinnamon's loaded fakexrandr .so matches the on-disk version.
+
+    Returns True if versions match, False if mismatch or can't determine.
+    """
+    loaded_path = _get_cinnamon_fakexrandr_path()
+    if not loaded_path:
+        return False
+
+    ondisk_path = _find_fakexrandr_lib()
+    if not ondisk_path:
+        return False
+
+    # Check if the loaded file is the same as the on-disk file
+    try:
+        loaded_stat = os.stat(loaded_path)
+        ondisk_stat = os.stat(ondisk_path)
+        if loaded_stat.st_dev == ondisk_stat.st_dev and loaded_stat.st_ino == ondisk_stat.st_ino:
+            return True
+    except OSError:
+        pass
+
+    # Files differ (or stat failed) — compare config versions
+    loaded_ver = _get_so_config_version(loaded_path)
+    ondisk_ver = _get_so_config_version(ondisk_path)
+    if loaded_ver != ondisk_ver:
+        log.info("fakexrandr version mismatch: loaded=%d, on-disk=%d", loaded_ver, ondisk_ver)
+        return False
+
+    # Same version but different files — could still be stale
+    # Check if the loaded path shows as deleted
+    pid = _get_cinnamon_pid()
+    if pid:
+        try:
+            with open(f'/proc/{pid}/maps', 'r') as f:
+                for line in f:
+                    if 'fakexrandr' in line and '(deleted)' in line:
+                        log.info("fakexrandr .so is deleted from disk (stale)")
+                        return False
+        except (OSError, PermissionError):
+            pass
+
+    return True
 
 CONFIG_PATH = os.path.join(
     os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')),
@@ -72,9 +150,11 @@ def _find_fakexrandr_lib():
 def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
     """Write ~/.config/fakexrandr.bin from the current split configuration.
 
-    Binary format per entry:
-        <length:4B uint><name:128B padded><edid:768B padded>
-        <width:4B uint><height:4B uint><split_count:4B uint><border:4B uint><tree_data>
+    Binary format:
+        Header: b"FXRD" + <version:4B uint>
+        Per entry:
+            <length:4B uint><name:128B padded><edid:768B padded>
+            <width:4B uint><height:4B uint><split_count:4B uint><border:4B uint><tree_data>
 
     Args:
         splits_dict: {output_name: SplitTree}
@@ -120,11 +200,14 @@ def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config, borders_di
     os.makedirs(config_dir, exist_ok=True)
 
     if entries:
+        header = FAKEXRANDR_CONFIG_MAGIC + struct.pack('I', FAKEXRANDR_CONFIG_VERSION)
         with open(CONFIG_PATH, 'wb') as f:
+            f.write(header)
             for entry in entries:
                 f.write(entry)
+        total = len(header) + sum(len(e) for e in entries)
         log.info("wrote fakexrandr config: %s (%d entries, %d bytes)",
-                 CONFIG_PATH, len(entries), sum(len(e) for e in entries))
+                 CONFIG_PATH, len(entries), total)
     else:
         # No splits active — remove config so fakexrandr passes through
         if os.path.exists(CONFIG_PATH):
@@ -217,7 +300,7 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, border
 
             regions = list(tree.leaf_regions(w, h, 0, 0, w_mm, h_mm))
             for i, (rx, ry, rw, rh, rmm_w, rmm_h) in enumerate(regions):
-                connector = "%s~%d" % (output_name, i)  # 0-indexed, matches setmonitor
+                connector = "%s~%d" % (output_name, i + 1)  # 1-indexed, matches fakexrandr
                 _add_logicalmonitor(
                     split_config, connector,
                     "unknown", "unknown", "unknown",
@@ -388,8 +471,11 @@ def ensure_fakexrandr_active(splits_dict, xrandr_state, xrandr_config, borders_d
         if not is_cinnamon_fakexrandr_loaded():
             log.info("Cinnamon doesn't have fakexrandr loaded, restarting")
             restart_cinnamon_with_fakexrandr(lib_path)
+        elif not is_cinnamon_fakexrandr_current():
+            log.info("Cinnamon has outdated fakexrandr loaded, restarting")
+            restart_cinnamon_with_fakexrandr(lib_path)
         else:
-            log.info("Cinnamon already has fakexrandr loaded, config updated")
+            log.info("Cinnamon already has current fakexrandr loaded, config updated")
     else:
         if is_cinnamon_fakexrandr_loaded():
             log.info("no splits active, restarting Cinnamon without fakexrandr")

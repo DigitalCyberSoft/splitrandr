@@ -230,6 +230,20 @@ class SplitTree:
                     self.left.to_fakexrandr_bytes(pos, height) +
                     self.right.to_fakexrandr_bytes(width - pos, height))
 
+    def to_dict(self):
+        if self.is_leaf:
+            return None
+        return {'d': self.direction, 'p': self.proportion,
+                'l': self.left.to_dict(), 'r': self.right.to_dict()}
+
+    @staticmethod
+    def from_dict(d):
+        if d is None:
+            return SplitTree.new_leaf()
+        return SplitTree(d['d'], d['p'],
+                         SplitTree.from_dict(d['l']),
+                         SplitTree.from_dict(d['r']))
+
     def copy(self):
         if self.is_leaf:
             return SplitTree.new_leaf()
