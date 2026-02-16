@@ -1,5 +1,6 @@
 PREFIX=/usr
-CFLAGS=-O2 $(shell pkg-config --cflags x11 xrandr 2>/dev/null)
+CFLAGS ?= -O2 -g
+CFLAGS += $(shell pkg-config --cflags x11 xrandr 2>/dev/null)
 LDFLAGS=$(shell pkg-config --libs x11 xrandr 2>/dev/null)
 
 all: libXrandr.so.2 libXinerama.so.1

@@ -1,5 +1,3 @@
-%global debug_package %{nil}
-
 Name:           splitrandr
 Version:        0.1.0
 Release:        1%{?dist}
@@ -37,7 +35,7 @@ physical monitors into multiple virtual screens for window management.
 cd fakexrandr && make clean || true
 
 %build
-cd fakexrandr && ./configure && make %{?_smp_mflags}
+cd fakexrandr && ./configure && make CFLAGS="%{optflags}" %{?_smp_mflags}
 
 %install
 # Python package
