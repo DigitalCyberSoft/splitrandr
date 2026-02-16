@@ -13,6 +13,7 @@ BuildRequires:  gcc
 BuildRequires:  python3-devel
 BuildRequires:  pkgconfig(xrandr)
 BuildRequires:  pkgconfig(xinerama)
+BuildRequires:  pkgconfig(xcb-randr)
 BuildRequires:  pkgconfig(x11)
 BuildRequires:  desktop-file-utils
 BuildRequires:  pkgconfig
