@@ -700,6 +700,329 @@ int XRRSetCrtcConfig(Display *dpy, XRRScreenResources *resources, RRCrtc crtc, T
 }
 
 /*
+	XRRGetMonitors override
+
+	Muffin (Cinnamon's WM) uses XRRGetMonitors() (XRandR 1.5) to discover
+	monitors. Without this override, it sees only physical monitors and
+	ignores our virtual splits, causing position reverts on SIGCONT resume.
+*/
+
+struct SplitRegion { unsigned int x, y, w, h; };
+
+static const char *_collect_leaf_regions(const char *config,
+	unsigned int x, unsigned int y, unsigned int w, unsigned int h,
+	struct SplitRegion *regions, int *count, int max_count) {
+
+	if(config[0] != 'N' && config[0] != 'H' && config[0] != 'V') {
+		return NULL;
+	}
+
+	if(config[0] == 'N') {
+		if(*count < max_count) {
+			regions[*count].x = x;
+			regions[*count].y = y;
+			regions[*count].w = w;
+			regions[*count].h = h;
+			(*count)++;
+		}
+		return config + 1;
+	}
+
+	unsigned int split_pos = *(unsigned int *)&config[1];
+	if(config[0] == 'H') {
+		if(split_pos == 0) split_pos = h / 2;
+		const char *next = _collect_leaf_regions(config + 1 + 4, x, y, w, split_pos, regions, count, max_count);
+		if(!next) return NULL;
+		return _collect_leaf_regions(next, x, y + split_pos, w, h - split_pos, regions, count, max_count);
+	}
+	else {
+		if(split_pos == 0) split_pos = w / 2;
+		const char *next = _collect_leaf_regions(config + 1 + 4, x, y, split_pos, h, regions, count, max_count);
+		if(!next) return NULL;
+		return _collect_leaf_regions(next, x + split_pos, y, w - split_pos, h, regions, count, max_count);
+	}
+}
+
+/*
+	Look up a config entry by output name. Returns the number of leaf
+	split regions, or 0 if no config matches. parent_output_xid is the
+	real X output XID for this output (used to build fake XIDs).
+*/
+static int _get_split_regions_for_output(Display *dpy, const char *output_name,
+	RROutput output_xid, struct SplitRegion *regions, int max_count,
+	unsigned int *out_config_w, unsigned int *out_config_h) {
+
+	if(!config_file) return 0;
+
+	char output_edid[768];
+	get_output_edid(dpy, output_xid, output_edid);
+
+	char *config;
+	for(config = config_file + config_data_offset; (int)(config - config_file) <= (int)config_file_size; ) {
+		unsigned int size = *(unsigned int *)config;
+		char *name = &config[4];
+		char *edid = &config[4 + 128];
+		unsigned int width = *(unsigned int *)&config[4 + 128 + 768];
+		unsigned int height = *(unsigned int *)&config[4 + 128 + 768 + 4];
+
+		int name_match = (output_name && strncmp(name, output_name, 128) == 0);
+		int edid_match = (strncmp(edid, output_edid, 768) == 0);
+
+		if(name_match || edid_match) {
+			char *tree_start;
+			if(config_has_border_field) {
+				tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;
+			} else {
+				tree_start = config + 4 + 128 + 768 + 4 + 4 + 4;
+			}
+
+			/* Use stored config dimensions (0 = use actual) */
+			*out_config_w = width;
+			*out_config_h = height;
+
+			int count = 0;
+			_collect_leaf_regions(tree_start, 0, 0,
+				width ? width : 9999, height ? height : 9999,
+				regions, &count, max_count);
+			return count;
+		}
+
+		config += 4 + size;
+	}
+
+	return 0;
+}
+
+XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int *nmonitors) {
+	int orig_count = 0;
+	XRRMonitorInfo *orig = _XRRGetMonitors(dpy, window, get_active, &orig_count);
+
+	if(!orig || orig_count <= 0) {
+		if(nmonitors) *nmonitors = orig_count;
+		return orig;
+	}
+
+	if(open_configuration()) {
+		/* No config — pass through */
+		if(nmonitors) *nmonitors = orig_count;
+		return orig;
+	}
+
+	/* We need real screen resources to look up output XIDs and info */
+	XRRScreenResources *res = _XRRGetScreenResourcesCurrent(dpy, window);
+	if(!res) {
+		if(nmonitors) *nmonitors = orig_count;
+		return orig;
+	}
+
+	#define MAX_SPLITS 16
+	struct SplitRegion regions[MAX_SPLITS];
+
+	/*
+		Pass 1: count how many monitors we'll have in the result,
+		and how many total outputs we need.
+	*/
+	int total_monitors = 0;
+	int total_outputs = 0;
+
+	for(int i = 0; i < orig_count; i++) {
+		char *atom_name = XGetAtomName(dpy, orig[i].name);
+		if(!atom_name) {
+			total_monitors++;
+			total_outputs += orig[i].noutput;
+			continue;
+		}
+
+		/* Check if this is a setmonitor VM (non-automatic, name contains ~) */
+		if(!orig[i].automatic && strchr(atom_name, '~')) {
+			/* Strip the ~N suffix to get the base output name */
+			char base_name[128];
+			strncpy(base_name, atom_name, sizeof(base_name) - 1);
+			base_name[sizeof(base_name) - 1] = '\0';
+			char *tilde = strchr(base_name, '~');
+			if(tilde) *tilde = '\0';
+
+			/* Check if this base name has a split config */
+			int has_config = 0;
+			for(int j = 0; j < res->noutput; j++) {
+				XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, res->outputs[j]);
+				if(oi) {
+					if(strcmp(oi->name, base_name) == 0) {
+						unsigned int cw, ch;
+						int n = _get_split_regions_for_output(dpy, base_name,
+							res->outputs[j], regions, MAX_SPLITS, &cw, &ch);
+						if(n > 0) has_config = 1;
+					}
+					_XRRFreeOutputInfo(oi);
+					if(has_config) break;
+				}
+			}
+
+			if(has_config) {
+				/* Skip this setmonitor VM — we'll replace with our splits */
+				XFree(atom_name);
+				continue;
+			}
+		}
+
+		/* Check if this is an automatic monitor whose output matches a split config */
+		if(orig[i].automatic && orig[i].noutput > 0) {
+			/* Find the output name for this monitor's first output */
+			RROutput mon_output = orig[i].outputs[0];
+			XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, mon_output);
+			if(oi && oi->name) {
+				unsigned int cw, ch;
+				int n = _get_split_regions_for_output(dpy, oi->name, mon_output,
+					regions, MAX_SPLITS, &cw, &ch);
+				if(n > 0) {
+					/* Verify dimensions match (0 in config = match anything) */
+					XRRCrtcInfo *ci = oi->crtc ? _XRRGetCrtcInfo(dpy, res, oi->crtc) : NULL;
+					int dims_match = 0;
+					if(ci) {
+						dims_match = (!cw || ci->width == cw) && (!ch || ci->height == ch);
+						_XRRFreeCrtcInfo(ci);
+					}
+					if(dims_match) {
+						total_monitors += n;
+						total_outputs += n; /* one output per virtual monitor */
+						_XRRFreeOutputInfo(oi);
+						XFree(atom_name);
+						continue;
+					}
+				}
+			}
+			if(oi) _XRRFreeOutputInfo(oi);
+		}
+
+		/* Non-split monitor: keep as-is */
+		total_monitors++;
+		total_outputs += orig[i].noutput;
+		XFree(atom_name);
+	}
+
+	/*
+		Pass 2: build the result array.
+		Allocate XRRMonitorInfo[] + RROutput[] in a single Xmalloc block.
+	*/
+	size_t info_size = total_monitors * sizeof(XRRMonitorInfo);
+	size_t outputs_size = total_outputs * sizeof(RROutput);
+	XRRMonitorInfo *result = Xmalloc(info_size + outputs_size);
+	if(!result) {
+		_XRRFreeScreenResources(res);
+		if(nmonitors) *nmonitors = orig_count;
+		return orig;
+	}
+
+	RROutput *output_pool = (RROutput *)((char *)result + info_size);
+	int out_idx = 0;
+	int out_output_idx = 0;
+
+	for(int i = 0; i < orig_count; i++) {
+		char *atom_name = XGetAtomName(dpy, orig[i].name);
+		if(!atom_name) {
+			result[out_idx] = orig[i];
+			result[out_idx].outputs = &output_pool[out_output_idx];
+			memcpy(result[out_idx].outputs, orig[i].outputs, orig[i].noutput * sizeof(RROutput));
+			out_output_idx += orig[i].noutput;
+			out_idx++;
+			continue;
+		}
+
+		/* Check if this is a setmonitor VM to skip */
+		if(!orig[i].automatic && strchr(atom_name, '~')) {
+			char base_name[128];
+			strncpy(base_name, atom_name, sizeof(base_name) - 1);
+			base_name[sizeof(base_name) - 1] = '\0';
+			char *tilde = strchr(base_name, '~');
+			if(tilde) *tilde = '\0';
+
+			int has_config = 0;
+			for(int j = 0; j < res->noutput; j++) {
+				XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, res->outputs[j]);
+				if(oi) {
+					if(strcmp(oi->name, base_name) == 0) {
+						unsigned int cw, ch;
+						int n = _get_split_regions_for_output(dpy, base_name,
+							res->outputs[j], regions, MAX_SPLITS, &cw, &ch);
+						if(n > 0) has_config = 1;
+					}
+					_XRRFreeOutputInfo(oi);
+					if(has_config) break;
+				}
+			}
+
+			if(has_config) {
+				XFree(atom_name);
+				continue;
+			}
+		}
+
+		/* Check if this is an automatic monitor to split */
+		if(orig[i].automatic && orig[i].noutput > 0) {
+			RROutput mon_output = orig[i].outputs[0];
+			XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, mon_output);
+			if(oi && oi->name) {
+				unsigned int cw, ch;
+				int n = _get_split_regions_for_output(dpy, oi->name, mon_output,
+					regions, MAX_SPLITS, &cw, &ch);
+				if(n > 0) {
+					XRRCrtcInfo *ci = oi->crtc ? _XRRGetCrtcInfo(dpy, res, oi->crtc) : NULL;
+					int dims_match = 0;
+					if(ci) {
+						dims_match = (!cw || ci->width == cw) && (!ch || ci->height == ch);
+					}
+					if(dims_match) {
+						/* Emit virtual monitors for each split region */
+						for(int s = 0; s < n; s++) {
+							char vname[128];
+							/* 1-indexed to match fakexrandr naming convention */
+							snprintf(vname, sizeof(vname), "%s~%d", oi->name, s + 1);
+
+							result[out_idx].name = XInternAtom(dpy, vname, False);
+							result[out_idx].automatic = False;
+							result[out_idx].primary = (s == 0) ? orig[i].primary : False;
+							result[out_idx].x = ci->x + regions[s].x;
+							result[out_idx].y = ci->y + regions[s].y;
+							result[out_idx].width = regions[s].w;
+							result[out_idx].height = regions[s].h;
+							/* Proportional physical mm dimensions */
+							result[out_idx].mwidth = orig[i].mwidth * regions[s].w / ci->width;
+							result[out_idx].mheight = orig[i].mheight * regions[s].h / ci->height;
+							result[out_idx].noutput = 1;
+							result[out_idx].outputs = &output_pool[out_output_idx];
+							/* Fake XID matching _config_foreach_split convention */
+							output_pool[out_output_idx] = (mon_output & ~XID_SPLIT_MASK) | ((s + 1) << XID_SPLIT_SHIFT);
+							out_output_idx++;
+							out_idx++;
+						}
+						if(ci) _XRRFreeCrtcInfo(ci);
+						_XRRFreeOutputInfo(oi);
+						XFree(atom_name);
+						continue;
+					}
+					if(ci) _XRRFreeCrtcInfo(ci);
+				}
+			}
+			if(oi) _XRRFreeOutputInfo(oi);
+		}
+
+		/* Non-split monitor: copy as-is */
+		result[out_idx] = orig[i];
+		result[out_idx].outputs = &output_pool[out_output_idx];
+		memcpy(result[out_idx].outputs, orig[i].outputs, orig[i].noutput * sizeof(RROutput));
+		out_output_idx += orig[i].noutput;
+		out_idx++;
+		XFree(atom_name);
+	}
+
+	_XRRFreeScreenResources(res);
+	_XRRFreeMonitors(orig);
+
+	if(nmonitors) *nmonitors = out_idx;
+	return result;
+}
+
+/*
 	Fake Xinerama
 
 	This is little overhead with all the work we already did above..

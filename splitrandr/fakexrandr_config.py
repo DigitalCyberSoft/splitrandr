@@ -22,19 +22,9 @@ FAKEXRANDR_CONFIG_MAGIC = b"FXRD"
 
 
 def _get_cinnamon_pid():
-    """Get the PID of the cinnamon process."""
-    try:
-        result = subprocess.run(
-            ['pgrep', '-x', 'cinnamon'],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            pids = result.stdout.strip().split('\n')
-            if pids and pids[0]:
-                return int(pids[0])
-    except Exception:
-        pass
-    return None
+    """Get the PID of the live (non-zombie) cinnamon process."""
+    from .cinnamon_compat import _get_cinnamon_pid as _impl
+    return _impl()
 
 
 def is_cinnamon_fakexrandr_loaded():
@@ -73,6 +63,10 @@ def _get_cinnamon_fakexrandr_path():
                 parts = line.split()
                 if len(parts) >= 6:
                     path = parts[5]
+                    # Only match shared library files, not config files
+                    if not (path.endswith('.so') or '.so.' in path
+                            or path.endswith('.so (deleted)')):
+                        continue
                     # The path may end with " (deleted)" if .so was replaced
                     if path.endswith('(deleted)'):
                         path = path.rsplit(' ', 1)[0].strip()
@@ -415,6 +409,9 @@ def restart_cinnamon_with_fakexrandr(lib_path=None):
     if lib_path not in existing:
         env['LD_PRELOAD'] = lib_path + (':' + existing if existing else '')
 
+    # Reap any zombie cinnamon children from previous restarts
+    _reap_children()
+
     log.info("restarting Cinnamon with LD_PRELOAD=%s", env['LD_PRELOAD'])
     subprocess.Popen(
         ['cinnamon', '--replace'], env=env,
@@ -438,6 +435,9 @@ def restart_cinnamon_without_fakexrandr():
             else:
                 env.pop('LD_PRELOAD', None)
 
+    # Reap any zombie cinnamon children from previous restarts
+    _reap_children()
+
     log.info("restarting Cinnamon without fakexrandr")
     subprocess.Popen(
         ['cinnamon', '--replace'], env=env,
@@ -445,6 +445,17 @@ def restart_cinnamon_without_fakexrandr():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     return True
+
+
+def _reap_children():
+    """Reap any zombie child processes (from previous cinnamon --replace calls)."""
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+    except ChildProcessError:
+        pass
 
 
 def ensure_fakexrandr_active(splits_dict, xrandr_state, xrandr_config, borders_dict=None):

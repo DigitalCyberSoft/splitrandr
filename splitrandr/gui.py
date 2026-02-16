@@ -48,7 +48,14 @@ class Application:
         accel.connect(key, mod, 0, lambda *a: self.do_apply_autostart())
         window.add_accel_group(accel)
 
-        # Widget
+        # Current (read-only) widget — shows Cinnamon's actual layout
+        self.current_widget = widget.MonitorWidget(
+            display=randr_display, force_version=force_version,
+            window=self.window, readonly=True
+        )
+        self.current_widget.load_from_x()
+
+        # Proposed (editable) widget
         self.widget = widget.MonitorWidget(
             display=randr_display, force_version=force_version,
             window=self.window
@@ -58,33 +65,13 @@ class Application:
         self.widget.connect('selection-changed', self._on_selection_changed)
         self.widget.connect('changed', self._on_widget_changed)
 
-        # Size window to 80% of the monitor the pointer is on.
-        display = Gdk.Display.get_default()
-        seat = display.get_default_seat()
-        pointer = seat.get_pointer()
-        _screen, px, py = pointer.get_position()
-        monitor = display.get_monitor_at_point(px, py)
-        workarea = monitor.get_workarea()
-        win_w = min(int(workarea.width * 0.8), 1200)
-        win_h = min(int(workarea.height * 0.8), 900)
-
-        # Set default size and max size hint so the preview widget
-        # cannot force the window taller than the target.
-        window.set_default_size(win_w, win_h)
-        hints = Gdk.Geometry()
-        hints.max_width = workarea.width
-        hints.max_height = workarea.height
-        window.set_geometry_hints(None, hints, Gdk.WindowHints.MAX_SIZE)
-
         # Single page layout (no notebook)
         main_page = self._build_page()
         window.add(main_page)
         window.show_all()
 
-        # Center in workarea
-        x = workarea.x + (workarea.width - win_w) // 2
-        y = workarea.y + (workarea.height - win_h) // 2
-        window.move(x, y)
+        # Maximize the window to give both canvases enough room
+        window.maximize()
 
         self._tray = None
 
@@ -109,20 +96,64 @@ class Application:
         # Initial control state
         self._update_controls_for_selection()
         self._populate_profiles_combo()
+        # No profile is active on fresh startup (we loaded from X, not a profile)
+        self._profile_combo.set_active(-1)
+
+        # Upgrade current widget to Cinnamon view after initial draw completes.
+        # Done via idle_add so the DBUS call doesn't block the first paint.
+        GLib.idle_add(self._upgrade_current_to_cinnamon)
+
+    def _upgrade_current_to_cinnamon(self):
+        self.current_widget.load_from_cinnamon()
+        return False
 
     #################### page layout ####################
 
     def _build_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
-        # Monitor preview area in a scrollable frame
+        # Side-by-side current vs proposed preview panes
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+
+        # Current (read-only) pane
+        current_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        current_label = Gtk.Label()
+        current_label.set_markup("<b>" + _("Current") + "</b>")
+        current_label.set_margin_top(4)
+        current_label.set_margin_bottom(2)
+        current_box.pack_start(current_label, False, False, 0)
+        current_frame = Gtk.Frame()
+        current_frame.set_shadow_type(Gtk.ShadowType.IN)
+        current_scroll = Gtk.ScrolledWindow()
+        current_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        current_scroll.add(self.current_widget)
+        current_frame.add(current_scroll)
+        current_box.pack_start(current_frame, True, True, 0)
+        paned.pack1(current_box, True, True)
+
+        # Proposed (editable) pane
+        proposed_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        proposed_label = Gtk.Label()
+        proposed_label.set_markup("<b>" + _("Proposed") + "</b>")
+        proposed_label.set_margin_top(4)
+        proposed_label.set_margin_bottom(2)
+        proposed_box.pack_start(proposed_label, False, False, 0)
         preview_frame = Gtk.Frame()
         preview_frame.set_shadow_type(Gtk.ShadowType.IN)
         preview_scroll = Gtk.ScrolledWindow()
         preview_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         preview_scroll.add(self.widget)
         preview_frame.add(preview_scroll)
-        page.pack_start(preview_frame, True, True, 0)
+        proposed_box.pack_start(preview_frame, True, True, 0)
+        paned.pack2(proposed_box, True, True)
+
+        # Set initial split at 50% once the window is allocated
+        def _set_paned_position(w, _alloc):
+            paned.set_position(paned.get_allocated_width() // 2)
+            paned.disconnect(self._paned_alloc_id)
+        self._paned_alloc_id = paned.connect('size-allocate', _set_paned_position)
+
+        page.pack_start(paned, True, True, 0)
 
         page.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
 
@@ -226,10 +257,6 @@ class Application:
         self._profile_combo.connect('changed', lambda c: self._on_profile_combo_changed())
         prof_row.pack_start(self._profile_combo, True, True, 0)
 
-        load_btn = Gtk.Button(label=_("Load"))
-        load_btn.connect('clicked', lambda b: self._on_load_profile())
-        prof_row.pack_start(load_btn, False, False, 0)
-
         save_btn = Gtk.Button(label=_("Save..."))
         save_btn.connect('clicked', lambda b: self.do_save_profile())
         prof_row.pack_start(save_btn, False, False, 0)
@@ -294,6 +321,10 @@ class Application:
         detect_btn.connect('clicked', lambda b: self._on_detect_displays())
         action_bar.pack_start(detect_btn, False, False, 0)
 
+        reload_cin_btn = Gtk.Button(label=_("Reload Cinnamon"))
+        reload_cin_btn.connect('clicked', lambda b: self._on_reload_cinnamon())
+        action_bar.pack_start(reload_cin_btn, False, False, 0)
+
         about_btn = Gtk.Button(label=_("About"))
         about_btn.connect('clicked', lambda b: self.about())
         action_bar.pack_start(about_btn, False, False, 0)
@@ -316,6 +347,27 @@ class Application:
     #################### control panel sync ####################
 
     def _on_selection_changed(self, _widget):
+        # Mirror selection to the current widget via geometry matching
+        name = self.widget.selected_output
+        mirror_name = None
+        if name and self.current_widget._is_cinnamon:
+            # Match by geometry: find a Cinnamon monitor at the same position/size
+            cfg = self.widget._xrandr.configuration.outputs.get(name)
+            if cfg and cfg.active:
+                px, py = cfg.position
+                pw, ph = cfg.size
+                for mon in self.current_widget._monitors:
+                    if (mon['x'] == px and mon['y'] == py and
+                            mon['w'] == pw and mon['h'] == ph):
+                        mirror_name = mon['name']
+                        break
+        elif name:
+            # Fallback: direct name match (xrandr-mode current widget)
+            mirror_name = name
+
+        if self.current_widget._selected_output != mirror_name:
+            self.current_widget._selected_output = mirror_name
+            self.current_widget._force_repaint()
         self._update_controls_for_selection()
 
     def _on_widget_changed(self, _widget):
@@ -588,9 +640,93 @@ class Application:
         self.widget._force_repaint()
 
     def _on_detect_displays(self):
+        self.current_widget.load_from_cinnamon()
         self.widget.load_from_x()
 
     def _on_reset_defaults(self):
+        self.widget.load_from_x()
+
+    def _on_reload_cinnamon(self):
+        """Force-restart Cinnamon with fakexrandr LD_PRELOAD and verify."""
+        from .fakexrandr_config import (
+            _find_fakexrandr_lib, restart_cinnamon_with_fakexrandr,
+            is_cinnamon_fakexrandr_loaded, is_cinnamon_fakexrandr_current,
+            write_fakexrandr_config, write_cinnamon_monitors_xml,
+        )
+        from .cinnamon_compat import _wait_cinnamon_on_dbus
+
+        lib_path = _find_fakexrandr_lib()
+        if not lib_path:
+            self.widget.error_message(
+                _("fakexrandr library not found.\n\n"
+                  "Build it with 'make' in the fakexrandr/ directory."))
+            return
+
+        # Write configs before restarting so the new Cinnamon picks them up
+        xrandr = self.widget._xrandr
+        try:
+            write_fakexrandr_config(
+                xrandr.configuration.splits, xrandr.state,
+                xrandr.configuration, xrandr.configuration.borders)
+            write_cinnamon_monitors_xml(
+                xrandr.configuration.splits, xrandr.state,
+                xrandr.configuration, xrandr.configuration.borders)
+        except Exception as e:
+            self.widget.error_message(
+                _("Failed to write configs: %s") % e)
+            return
+
+        restart_cinnamon_with_fakexrandr(lib_path)
+
+        # Show a progress dialog while waiting for Cinnamon to come back
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window, modal=True,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.NONE,
+            text=_("Restarting Cinnamon..."),
+        )
+        dialog.format_secondary_text(
+            _("Waiting for Cinnamon to restart with fakexrandr."))
+        dialog.show_all()
+
+        # Process GTK events so the dialog renders
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+        ready = _wait_cinnamon_on_dbus(timeout=15.0)
+        dialog.destroy()
+
+        if not ready:
+            self.widget.error_message(
+                _("Cinnamon did not respond on D-Bus within 15 seconds."))
+            return
+
+        # Verify
+        loaded = is_cinnamon_fakexrandr_loaded()
+        current = is_cinnamon_fakexrandr_current()
+
+        if loaded and current:
+            dialog = Gtk.MessageDialog(
+                transient_for=self.window, modal=True,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text=_("Cinnamon restarted successfully."),
+            )
+            dialog.format_secondary_text(
+                _("fakexrandr is loaded and current."))
+            dialog.run()
+            dialog.destroy()
+        elif loaded:
+            self.widget.error_message(
+                _("fakexrandr is loaded but the version is stale.\n\n"
+                  "Rebuild the library and try again."))
+        else:
+            self.widget.error_message(
+                _("fakexrandr is NOT loaded in the new Cinnamon process.\n\n"
+                  "LD_PRELOAD may have been stripped."))
+
+        # Refresh both panes
+        self.current_widget.load_from_cinnamon()
         self.widget.load_from_x()
 
     #################### apply / revert ####################
@@ -771,9 +907,8 @@ class Application:
             self._updating_controls = False
 
     def _on_profile_combo_changed(self):
-        pass  # selection only - Load button triggers action
-
-    def _on_load_profile(self):
+        if self._updating_controls:
+            return
         name = self._profile_combo.get_active_id()
         if name:
             self._do_load_profile(name)
@@ -857,6 +992,7 @@ class Application:
     def _on_zoom_toggled(self, button, value):
         if button.get_active():
             self.widget.factor = value
+            self.current_widget.factor = value
 
     #################### window management ####################
 

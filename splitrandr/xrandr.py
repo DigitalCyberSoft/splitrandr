@@ -12,6 +12,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import warnings
 import logging
 from functools import reduce
@@ -680,6 +681,67 @@ class XRandR:
             self._log_tree("left", tree.left, indent + "  ")
             self._log_tree("right", tree.right, indent + "  ")
 
+    def _query_output_positions(self):
+        """Query xrandr for current output positions. Returns {name: (x, y)} for active outputs."""
+        positions = {}
+        try:
+            output = self._output("--query")
+            for line in output.split('\n'):
+                if line.startswith(('\t', ' ', 'Screen')):
+                    continue
+                parts = line.split()
+                if len(parts) < 3 or parts[1] not in ('connected', 'disconnected', 'unknown-connection'):
+                    continue
+                name = parts[0]
+                # Find geometry (WxH+X+Y)
+                for p in parts[2:]:
+                    m = re.match(r'\d+x\d+\+(\d+)\+(\d+)', p)
+                    if m:
+                        positions[name] = (int(m.group(1)), int(m.group(2)))
+                        break
+        except Exception as e:
+            log.warning("failed to query output positions: %s", e)
+        return positions
+
+    def _verify_and_correct_positions(self, max_attempts=3, delay=0.5):
+        """Verify output positions match configuration, re-apply if not.
+
+        The nvidia driver processes mode changes asynchronously.  Even after
+        xrandr returns success, outputs may not yet be at their requested
+        positions.  This method waits and re-applies until positions match.
+        """
+        for attempt in range(max_attempts):
+            time.sleep(delay)
+            current = self._query_output_positions()
+            mismatched = []
+            for name, out_cfg in self.configuration.outputs.items():
+                if not out_cfg.active:
+                    continue
+                expected = (out_cfg.position[0], out_cfg.position[1])
+                actual = current.get(name)
+                if actual is None:
+                    continue
+                if actual != expected:
+                    mismatched.append((name, expected, actual))
+            if not mismatched:
+                log.info("output positions verified correct (attempt %d)", attempt + 1)
+                return
+            for name, expected, actual in mismatched:
+                log.warning("position mismatch for %s: expected %s, got %s (attempt %d)",
+                           name, expected, actual, attempt + 1)
+            log.info("re-applying xrandr config to correct positions")
+            self._run(*self.configuration.commandlineargs())
+        # Final check
+        current = self._query_output_positions()
+        for name, out_cfg in self.configuration.outputs.items():
+            if not out_cfg.active:
+                continue
+            expected = (out_cfg.position[0], out_cfg.position[1])
+            actual = current.get(name)
+            if actual and actual != expected:
+                log.error("position still wrong for %s after %d attempts: expected %s, got %s",
+                         name, max_attempts, expected, actual)
+
     def save_to_x(self):
         self.check_configuration()
 
@@ -688,32 +750,38 @@ class XRandR:
         for name, tree in self.configuration.splits.items():
             self._log_tree(name, tree)
 
-        # Clear fakexrandr config so the real physical outputs become
-        # visible to xrandr.  When fakexrandr is active, it replaces
-        # DP-5 with DP-5~1/~2/~3 — clearing the config makes it pass
-        # through, restoring the real DP-5 for the commands below.
-        try:
-            from .fakexrandr_config import CONFIG_PATH
-            if os.path.exists(CONFIG_PATH):
-                os.remove(CONFIG_PATH)
-                log.info("cleared fakexrandr config to expose real outputs")
-        except Exception as e:
-            log.warning("failed to clear fakexrandr config: %s", e)
-
-        # Apply main configuration (before any setmonitor calls)
-        log.info("applying main xrandr config")
-        self._run(*self.configuration.commandlineargs())
-
-        # Refresh EDIDs while fakexrandr is in pass-through mode.
-        # When loaded with fakexrandr active, virtual outputs have no EDID.
-        # Now that fakexrandr.bin is cleared, real outputs are visible.
-        self._refresh_edids()
-
-        # Wrap delmonitor + setmonitor in Cinnamon safety guard.
-        # Muffin >= 5.4.0 segfaults on setmonitor events, so we
-        # SIGSTOP Cinnamon and disable csd-xrandr during these calls.
+        # Disable csd-xrandr and freeze Cinnamon BEFORE any xrandr changes.
+        # If we run the main xrandr command first, CSD-xrandr reacts to the
+        # RandR event and re-applies the OLD monitors.xml, clobbering our
+        # output positions.  Wrapping everything in the guard prevents this.
         from .cinnamon_compat import CinnamonSetMonitorGuard
         with CinnamonSetMonitorGuard():
+            # Clear fakexrandr config so the real physical outputs become
+            # visible to xrandr.  When fakexrandr is active, it replaces
+            # DP-5 with DP-5~1/~2/~3 — clearing the config makes it pass
+            # through, restoring the real DP-5 for the commands below.
+            try:
+                from .fakexrandr_config import CONFIG_PATH
+                if os.path.exists(CONFIG_PATH):
+                    os.remove(CONFIG_PATH)
+                    log.info("cleared fakexrandr config to expose real outputs")
+            except Exception as e:
+                log.warning("failed to clear fakexrandr config: %s", e)
+
+            # Apply main configuration (before any setmonitor calls)
+            log.info("applying main xrandr config")
+            self._run(*self.configuration.commandlineargs())
+
+            # The nvidia driver processes output changes asynchronously.
+            # After the xrandr command returns, outputs may still be at
+            # their old positions.  Wait briefly and re-apply if needed.
+            self._verify_and_correct_positions(max_attempts=3, delay=0.5)
+
+            # Refresh EDIDs while fakexrandr is in pass-through mode.
+            # When loaded with fakexrandr active, virtual outputs have no EDID.
+            # Now that fakexrandr.bin is cleared, real outputs are visible.
+            self._refresh_edids()
+
             # Delete ALL existing virtual monitors (anything with ~ in the name)
             try:
                 listmon_output = self._output("--listmonitors")
@@ -825,17 +893,18 @@ class XRandR:
                     if not _wait_cinnamon_on_dbus(timeout=15.0):
                         log.warning("Cinnamon did not respond on D-Bus within timeout, proceeding anyway")
 
-                    # Clear fakexrandr config so xrandr sees real outputs
-                    try:
-                        if os.path.exists(CONFIG_PATH):
-                            os.remove(CONFIG_PATH)
-                    except Exception:
-                        pass
-
-                    log.info("re-applying xrandr config after Cinnamon restart")
-                    self._run(*self.configuration.commandlineargs())
-
                     with CinnamonSetMonitorGuard():
+                        # Clear fakexrandr config so xrandr sees real outputs
+                        try:
+                            if os.path.exists(CONFIG_PATH):
+                                os.remove(CONFIG_PATH)
+                        except Exception:
+                            pass
+
+                        log.info("re-applying xrandr config after Cinnamon restart")
+                        self._run(*self.configuration.commandlineargs())
+                        self._verify_and_correct_positions(max_attempts=3, delay=0.5)
+
                         try:
                             listmon_output = self._output("--listmonitors")
                             for line in listmon_output.strip().split('\n'):
@@ -888,6 +957,10 @@ class XRandR:
                             self.configuration.splits, self.state, self.configuration,
                             self.configuration.borders
                         )
+                        write_cinnamon_monitors_xml(
+                            self.configuration.splits, self.state, self.configuration,
+                            self.configuration.borders
+                        )
 
                     log.info("re-applied config after Cinnamon restart")
 
@@ -896,6 +969,107 @@ class XRandR:
                 restart_cinnamon_without_fakexrandr()
         except Exception as e:
             log.warning("fakexrandr integration failed: %s", e)
+
+        # Final verification: after all guards have exited and Cinnamon
+        # has resumed, poll for a few seconds to catch Muffin reverting
+        # our layout.  Muffin processes queued RandR events asynchronously
+        # and may take several seconds to re-apply its monitor config.
+        needs_correction = False
+        for check_round in range(4):
+            time.sleep(1.0)
+            final_positions = self._query_output_positions()
+            for name, out_cfg in self.configuration.outputs.items():
+                if not out_cfg.active:
+                    continue
+                # Skip split outputs: fakexrandr hides the physical output
+                # (e.g. DP-5 becomes DP-5~1/~2/~3), so it won't appear in
+                # xrandr --query.  Check non-split outputs only.
+                if name in self.configuration.splits:
+                    continue
+                expected = (out_cfg.position[0], out_cfg.position[1])
+                actual = final_positions.get(name)
+                if actual is None or actual != expected:
+                    log.warning("final check (round %d): %s at %s, expected %s",
+                               check_round + 1, name, actual, expected)
+                    needs_correction = True
+            if needs_correction:
+                break
+        if needs_correction:
+            log.info("positions drifted after Cinnamon resumed, re-applying")
+            with CinnamonSetMonitorGuard():
+                try:
+                    from .fakexrandr_config import CONFIG_PATH
+                    if os.path.exists(CONFIG_PATH):
+                        os.remove(CONFIG_PATH)
+                except Exception:
+                    pass
+                self._run(*self.configuration.commandlineargs())
+                self._verify_and_correct_positions(max_attempts=3, delay=0.5)
+
+                # Re-create setmonitor VMs
+                try:
+                    listmon_output = self._output("--listmonitors")
+                    for line in listmon_output.strip().split('\n'):
+                        line = line.strip()
+                        if line.startswith('Monitors:'):
+                            continue
+                        m_mon = re.match(r'\d+:\s+[+*]*(\S+)', line)
+                        if m_mon and '~' in m_mon.group(1):
+                            self._run_no_preload_ignore_error("--delmonitor", m_mon.group(1))
+                except Exception:
+                    pass
+
+                for output_name, tree in self.configuration.splits.items():
+                    output_cfg = self.configuration.outputs.get(output_name)
+                    if not output_cfg or not output_cfg.active:
+                        continue
+                    output_state = self.state.outputs.get(output_name)
+                    w_mm = output_state.physical_w_mm if output_state else 0
+                    h_mm = output_state.physical_h_mm if output_state else 0
+                    border = self.configuration.borders.get(output_name, 0)
+                    commands = tree.to_setmonitor_commands(
+                        output_name,
+                        output_cfg.size[0], output_cfg.size[1],
+                        output_cfg.position[0], output_cfg.position[1],
+                        w_mm, h_mm, border
+                    )
+                    for mon_name, geom, out in commands:
+                        self._run_no_preload("--setmonitor", mon_name, geom, out)
+
+                for output_name, border_val in self.configuration.borders.items():
+                    if border_val <= 0 or output_name in self.configuration.splits:
+                        continue
+                    output_cfg = self.configuration.outputs.get(output_name)
+                    if not output_cfg or not output_cfg.active:
+                        continue
+                    output_state = self.state.outputs.get(output_name)
+                    w_mm = output_state.physical_w_mm if output_state else 0
+                    h_mm = output_state.physical_h_mm if output_state else 0
+                    w, h = output_cfg.size
+                    ox, oy = output_cfg.position
+                    bw = max(w - 2 * border_val, 1)
+                    bh = max(h - 2 * border_val, 1)
+                    mon_name = "%s~0" % output_name
+                    geom = "%d/%dx%d/%d+%d+%d" % (bw, w_mm, bh, h_mm, ox + border_val, oy + border_val)
+                    self._run_no_preload("--setmonitor", mon_name, geom, output_name)
+
+                try:
+                    from .fakexrandr_config import write_fakexrandr_config
+                    write_fakexrandr_config(
+                        self.configuration.splits, self.state, self.configuration,
+                        self.configuration.borders
+                    )
+                except Exception:
+                    pass
+                try:
+                    from .fakexrandr_config import write_cinnamon_monitors_xml
+                    write_cinnamon_monitors_xml(
+                        self.configuration.splits, self.state, self.configuration,
+                        self.configuration.borders
+                    )
+                except Exception:
+                    pass
+            log.info("final correction applied")
 
         # Restart xapp-sn-watcher so it picks up the new monitor layout.
         # Its GDK caches monitor geometry and doesn't update on setmonitor
@@ -1013,6 +1187,18 @@ class XRandR:
 
         def commandlineargs(self):
             args = []
+            # Pre-set the framebuffer size so the nvidia driver doesn't
+            # misplace outputs when resizing the screen.  Without this,
+            # nvidia processes outputs sequentially and may temporarily
+            # shrink the screen, making later output positions invalid.
+            fb_w = 0
+            fb_h = 0
+            for output in self.outputs.values():
+                if output.active:
+                    fb_w = max(fb_w, output.position[0] + output.size[0])
+                    fb_h = max(fb_h, output.position[1] + output.size[1])
+            if fb_w > 0 and fb_h > 0:
+                args.extend(["--fb", "%dx%d" % (fb_w, fb_h)])
             for output_name, output in self.outputs.items():
                 args.append("--output")
                 args.append(output_name)

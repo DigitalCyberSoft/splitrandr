@@ -18,6 +18,7 @@ from .snap import Snap
 from .xrandr import XRandR, Feature
 from .auxiliary import Position, NORMAL, ROTATIONS, InadequateConfiguration
 from .splits import SplitTree, SplitEditorDialog, SPLIT_COLORS
+from .cinnamon_compat import query_cinnamon_monitors
 from .i18n import _
 
 # CSS for themed monitor rendering
@@ -99,6 +100,10 @@ class _MonitorIdentifier(Gtk.Window):
         self.connect('draw', self._on_draw)
         self.show_all()
 
+        # Make the overlay click-through by setting an empty input region
+        empty_region = cairo.Region(cairo.RectangleInt(0, 0, 0, 0))
+        self.get_window().input_shape_combine_region(empty_region, 0, 0)
+
     def _on_draw(self, widget, cr):
         cr.set_source_rgba(0, 0, 0, 0)
         cr.set_operator(cairo.OPERATOR_SOURCE)
@@ -140,7 +145,6 @@ class _MonitorIdentifier(Gtk.Window):
 
 class MonitorWidget(Gtk.DrawingArea):
 
-    sequence = None
     _draggingoutput = None
     _draggingfrom = None
     _draggingsnap = None
@@ -164,28 +168,33 @@ class MonitorWidget(Gtk.DrawingArea):
             self._selected_output = name
             self._force_repaint()
             self.emit('selection-changed')
-            self._show_monitor_indicator(name)
+            if not self._readonly:
+                self._show_monitor_indicator(name)
 
-    def __init__(self, window, factor=8, display=None, force_version=False):
+    def __init__(self, window, factor=8, display=None, force_version=False,
+                 readonly=False):
         super(MonitorWidget, self).__init__()
 
         self.window = window
         self._factor = factor
+        self._readonly = readonly
         self._theme_colors = _get_theme_colors()
         self._screenshots = {}
+        self._monitors = []
+        self._is_cinnamon = False
 
         self.set_size_request(
             1024 // self.factor, 1024 // self.factor
         )
 
-        self.connect('button-press-event', self.click)
-        self.set_events(
-            Gdk.EventMask.BUTTON_PRESS_MASK |
-            Gdk.EventMask.POINTER_MOTION_MASK
-        )
-        self.connect('motion-notify-event', self._on_motion)
-
-        self.setup_draganddrop()
+        if not readonly:
+            self.connect('button-press-event', self.click)
+            self.set_events(
+                Gdk.EventMask.BUTTON_PRESS_MASK |
+                Gdk.EventMask.POINTER_MOTION_MASK
+            )
+            self.connect('motion-notify-event', self._on_motion)
+            self.setup_draganddrop()
 
         self._xrandr = XRandR(display=display, force_version=force_version)
 
@@ -225,15 +234,36 @@ class MonitorWidget(Gtk.DrawingArea):
         dialog.run()
         dialog.destroy()
 
+    def _sync_monitors(self):
+        """Build _monitors list from _xrandr.configuration."""
+        self._monitors = []
+        cfg = self._xrandr.configuration
+        for name in sorted(cfg.outputs):
+            out = cfg.outputs[name]
+            if not out.active:
+                continue
+            pos = (out.tentative_position if hasattr(out, 'tentative_position')
+                   else out.position)
+            self._monitors.append({
+                'name': name,
+                'x': pos[0], 'y': pos[1],
+                'w': out.size[0], 'h': out.size[1],
+                'primary': out.primary,
+                'rotation': out.rotation,
+                'splits': cfg.splits.get(name),
+                'border': cfg.borders.get(name, 0),
+            })
+
     def _update_size_request(self):
-        max_gapless = sum(
-            max(output.size) if output.active else 0
-            for output in self._xrandr.configuration.outputs.values()
-        )
-        usable_size = int(max_gapless * 1.1)
-        xdim = min(self._xrandr.state.virtual.max[0], usable_size)
-        ydim = min(self._xrandr.state.virtual.max[1], usable_size)
-        self.set_size_request(xdim // self.factor, ydim // self.factor)
+        if not self._monitors:
+            self.set_size_request(128, 128)
+            return
+        max_x = max(m['x'] + m['w'] for m in self._monitors)
+        max_y = max(m['y'] + m['h'] for m in self._monitors)
+        # 10% margin
+        cw = int(max_x * 1.1)
+        ch = int(max_y * 1.1)
+        self.set_size_request(cw // self.factor, ch // self.factor)
 
     #################### screenshots ####################
 
@@ -247,16 +277,13 @@ class MonitorWidget(Gtk.DrawingArea):
         except Exception:
             return
 
-        for output_name in self.sequence:
-            cfg = self._xrandr.configuration.outputs[output_name]
-            if not cfg.active:
-                continue
-            x, y = cfg.position
-            w, h = cfg.size
+        for m in self._monitors:
+            name = m['name']
+            x, y, w, h = m['x'], m['y'], m['w'], m['h']
             try:
                 pb = Gdk.pixbuf_get_from_window(root, x, y, w, h)
                 if pb:
-                    self._screenshots[output_name] = pb
+                    self._screenshots[name] = pb
             except Exception:
                 pass
 
@@ -295,16 +322,14 @@ class MonitorWidget(Gtk.DrawingArea):
         self._xrandr_was_reloaded()
 
     def _xrandr_was_reloaded(self):
-        self.sequence = sorted(self._xrandr.outputs)
+        self._is_cinnamon = False
+        self._sync_monitors()
 
         # Validate selection
-        active_outputs = [
-            name for name, cfg in self._xrandr.configuration.outputs.items()
-            if cfg.active
-        ]
-        if self._selected_output not in active_outputs:
-            if len(active_outputs) == 1:
-                self._selected_output = active_outputs[0]
+        active_names = [m['name'] for m in self._monitors]
+        if self._selected_output not in active_names:
+            if len(active_names) == 1:
+                self._selected_output = active_names[0]
             else:
                 self._selected_output = None
 
@@ -316,6 +341,41 @@ class MonitorWidget(Gtk.DrawingArea):
 
         # Capture screenshots after a brief delay to let the display settle
         GLib.timeout_add(200, self._capture_screenshots)
+
+    def load_from_cinnamon(self):
+        """Load monitor layout from Cinnamon's compositor via DBUS.
+
+        Falls back to load_from_x() if Cinnamon is not available.
+        """
+        monitors = query_cinnamon_monitors()
+        if monitors is None:
+            self._is_cinnamon = False
+            self.load_from_x()
+            return
+
+        self._is_cinnamon = True
+        self._monitors = []
+        for m in monitors:
+            self._monitors.append({
+                'name': m['name'],
+                'x': m['x'], 'y': m['y'],
+                'w': m['width'], 'h': m['height'],
+                'primary': m.get('primary', False),
+                'rotation': None,
+                'splits': None,
+                'border': 0,
+            })
+
+        # Validate selection
+        names = [m['name'] for m in self._monitors]
+        if self._selected_output not in names:
+            self._selected_output = None
+
+        self._update_size_request()
+        if self.window:
+            self._force_repaint()
+        self.emit('changed')
+        self.emit('selection-changed')
 
     def save_to_x(self):
         self._xrandr.save_to_x()
@@ -332,6 +392,7 @@ class MonitorWidget(Gtk.DrawingArea):
             setattr(self._xrandr.configuration.outputs[output_name], which, old)
             raise
 
+        self._sync_monitors()
         self._force_repaint()
         self.emit('changed')
 
@@ -356,6 +417,7 @@ class MonitorWidget(Gtk.DrawingArea):
         else:
             return
 
+        self._sync_monitors()
         self._force_repaint()
         self.emit('changed')
 
@@ -383,6 +445,7 @@ class MonitorWidget(Gtk.DrawingArea):
                 output.mode = first_mode
                 output.rotation = NORMAL
 
+        self._sync_monitors()
         self._force_repaint()
         self.emit('changed')
 
@@ -392,7 +455,9 @@ class MonitorWidget(Gtk.DrawingArea):
         old_hover = self._hover_output
         undermouse = self._get_point_outputs(event.x, event.y)
         if undermouse:
-            self._hover_output = [a for a in self.sequence if a in undermouse][-1]
+            # Topmost monitor in _monitors list order (last in list = on top)
+            self._hover_output = [m['name'] for m in self._monitors
+                                  if m['name'] in undermouse][-1]
         else:
             self._hover_output = None
         if old_hover != self._hover_output:
@@ -401,64 +466,51 @@ class MonitorWidget(Gtk.DrawingArea):
     #################### painting ####################
 
     def do_expose_event(self, _event, context):
-        context.rectangle(
-            0, 0,
-            self._xrandr.state.virtual.max[0] // self.factor,
-            self._xrandr.state.virtual.max[1] // self.factor
-        )
-        context.clip()
-
-        # clear
+        # Black background fills entire allocation
+        alloc = self.get_allocation()
         context.set_source_rgb(0, 0, 0)
-        context.rectangle(0, 0, *self.window.get_size())
+        context.rectangle(0, 0, alloc.width, alloc.height)
         context.fill()
-        context.save()
 
+        if not self._monitors:
+            return
+
+        context.save()
         context.scale(1 / self.factor, 1 / self.factor)
         context.set_line_width(self.factor * 1.5)
+        self._draw_monitors(context)
+        context.restore()
 
-        self._draw(self._xrandr, context)
-
-    def _draw(self, xrandr, context):
-        cfg = xrandr.configuration
-        state = xrandr.state
-
-        context.set_source_rgb(0.25, 0.25, 0.25)
-        context.rectangle(0, 0, *state.virtual.max)
-        context.fill()
-
+    def _draw_monitors(self, context):
+        """Unified draw method for all monitors in _monitors list."""
+        # Gray bounding box background
+        max_x = max(m['x'] + m['w'] for m in self._monitors)
+        max_y = max(m['y'] + m['h'] for m in self._monitors)
         context.set_source_rgb(0.5, 0.5, 0.5)
-        context.rectangle(0, 0, *cfg.virtual)
+        context.rectangle(0, 0, max_x, max_y)
         context.fill()
 
         colors = self._theme_colors
 
-        for output_name in self.sequence:
-            output = cfg.outputs[output_name]
-            if not output.active:
-                continue
-
-            rect = (output.tentative_position if hasattr(
-                output, 'tentative_position') else output.position) + tuple(output.size)
+        for mon in self._monitors:
+            name = mon['name']
+            rect = (mon['x'], mon['y'], mon['w'], mon['h'])
             center = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
 
-            is_hover = (output_name == self._hover_output)
-            is_selected = (output_name == self._selected_output)
+            is_hover = (not self._readonly and name == self._hover_output)
+            is_selected = (name == self._selected_output)
             radius = min(rect[2], rect[3]) * 0.02
             radius = max(4, min(radius, 12))
 
-            # Paint themed rounded rectangle
-            if is_hover:
-                bg = colors['bg_hover']
-            else:
-                bg = colors['bg']
+            # Fill
+            bg = colors['bg_hover'] if is_hover else colors['bg']
             _rounded_rect(context, rect[0], rect[1], rect[2], rect[3], radius)
             context.set_source_rgba(*bg)
             context.fill()
 
-            # Draw screenshot thumbnail if available
-            if output_name in self._screenshots:
-                pb = self._screenshots[output_name]
+            # Screenshot thumbnail
+            if name in self._screenshots:
+                pb = self._screenshots[name]
                 context.save()
                 _rounded_rect(context, rect[0], rect[1], rect[2], rect[3], radius)
                 context.clip()
@@ -470,31 +522,29 @@ class MonitorWidget(Gtk.DrawingArea):
                 context.paint_with_alpha(0.45)
                 context.restore()
 
-            # Border
+            # Border stroke
             _rounded_rect(context, rect[0], rect[1], rect[2], rect[3], radius)
             if is_selected:
                 context.set_source_rgba(0.2, 0.5, 0.9, 0.9)
                 context.set_line_width(4)
             else:
-                border = colors['border']
-                context.set_source_rgba(*border)
+                context.set_source_rgba(*colors['border'])
                 context.set_line_width(2)
             context.stroke()
 
-            # Draw split overlay if this output has splits
-            if output_name in cfg.splits:
-                border = cfg.borders.get(output_name, 0)
+            # Split overlay
+            splits = mon['splits']
+            border = mon['border']
+            if splits:
                 self._draw_split_overlay(
-                    context, cfg.splits[output_name],
+                    context, splits,
                     rect[0], rect[1], rect[2], rect[3],
                     border
                 )
-            elif cfg.borders.get(output_name, 0) > 0:
+            elif border > 0:
                 # Unsplit output with border — show inset region
-                border = cfg.borders[output_name]
-                oc = cfg.outputs[output_name]
-                bx_frac = border / oc.size[0] if oc.size[0] > 0 else 0
-                by_frac = border / oc.size[1] if oc.size[1] > 0 else 0
+                bx_frac = border / mon['w'] if mon['w'] > 0 else 0
+                by_frac = border / mon['h'] if mon['h'] > 0 else 0
                 px = rect[0] + bx_frac * rect[2]
                 py = rect[1] + by_frac * rect[3]
                 pw = max(rect[2] * (1 - 2 * bx_frac), 0)
@@ -509,30 +559,32 @@ class MonitorWidget(Gtk.DrawingArea):
                 context.stroke()
                 context.set_dash([])
 
-            # Draw output name: large, bold, white on dark backdrop
+            # Name label
             context.save()
 
-            textwidth = rect[3 if output.rotation.is_odd else 2]
-            widthperchar = textwidth / max(len(output_name), 1)
+            rotation = mon['rotation']
+            is_odd_rotation = rotation and rotation.is_odd
+            textwidth = rect[3] if is_odd_rotation else rect[2]
+            widthperchar = textwidth / max(len(name), 1)
             textheight = int(widthperchar * 0.8)
-            textheight = max(textheight, 40)
+            textheight = max(40, min(textheight, 200))
 
             newdescr = Pango.FontDescription("sans bold")
             newdescr.set_size(textheight * Pango.SCALE)
 
-            output_name_markup = GLib.markup_escape_text(output_name)
+            name_markup = GLib.markup_escape_text(name)
             layout = PangoCairo.create_layout(context)
             layout.set_font_description(newdescr)
-            if output.primary:
-                output_name_markup = "<u>%s</u>" % output_name_markup
-
-            layout.set_markup(output_name_markup, -1)
+            if mon['primary']:
+                name_markup = "<u>%s</u>" % name_markup
+            layout.set_markup(name_markup, -1)
 
             layoutsize = layout.get_pixel_size()
 
             # Compute text position at center, handling rotation
             context.move_to(*center)
-            context.rotate(output.rotation.angle)
+            if rotation:
+                context.rotate(rotation.angle)
             text_x = -layoutsize[0] / 2
             text_y = -layoutsize[1] / 2
 
@@ -548,7 +600,8 @@ class MonitorWidget(Gtk.DrawingArea):
 
             # White text
             context.move_to(*center)
-            context.rotate(output.rotation.angle)
+            if rotation:
+                context.rotate(rotation.angle)
             context.rel_move_to(text_x, text_y)
             context.set_source_rgba(1, 1, 1, 0.95)
             PangoCairo.show_layout(context, layout)
@@ -590,11 +643,7 @@ class MonitorWidget(Gtk.DrawingArea):
             context.set_dash([])
 
     def _force_repaint(self):
-        self.queue_draw_area(
-            0, 0,
-            self._xrandr.state.virtual.max[0] // self.factor,
-            self._xrandr.state.virtual.max[1] // self.factor
-        )
+        self.queue_draw()
 
     #################### click handling ####################
 
@@ -602,8 +651,11 @@ class MonitorWidget(Gtk.DrawingArea):
         undermouse = self._get_point_outputs(event.x, event.y)
         if event.button == 1 and undermouse:
             which = self._get_point_active_output(event.x, event.y)
-            self.sequence.remove(which)
-            self.sequence.append(which)
+            # Bring clicked monitor to top of draw order
+            for i, m in enumerate(self._monitors):
+                if m['name'] == which:
+                    self._monitors.append(self._monitors.pop(i))
+                    break
 
             self.selected_output = which
             self._force_repaint()
@@ -611,7 +663,8 @@ class MonitorWidget(Gtk.DrawingArea):
             self.selected_output = None
         if event.button == 3:
             if undermouse:
-                target = [a for a in self.sequence if a in undermouse][-1]
+                target = [m['name'] for m in self._monitors
+                          if m['name'] in undermouse][-1]
                 menu = self._contextmenu(target)
                 menu.popup(None, None, None, None, event.button, event.time)
             else:
@@ -622,23 +675,16 @@ class MonitorWidget(Gtk.DrawingArea):
 
     def _get_point_outputs(self, x, y):
         x, y = x * self.factor, y * self.factor
-        outputs = set()
-        for output_name, output in self._xrandr.configuration.outputs.items():
-            if not output.active:
-                continue
-            if (
-                    output.position[0] - self.factor <= x <= output.position[0] + output.size[0] + self.factor
-            ) and (
-                output.position[1] - self.factor <= y <= output.position[1] + output.size[1] + self.factor
-            ):
-                outputs.add(output_name)
-        return outputs
+        return {m['name'] for m in self._monitors
+                if m['x'] - self.factor <= x <= m['x'] + m['w'] + self.factor
+                and m['y'] - self.factor <= y <= m['y'] + m['h'] + self.factor}
 
     def _get_point_active_output(self, x, y):
         undermouse = self._get_point_outputs(x, y)
         if not undermouse:
             raise IndexError("No output here.")
-        active = [a for a in self.sequence if a in undermouse][-1]
+        # Topmost in _monitors list order
+        active = [m['name'] for m in self._monitors if m['name'] in undermouse][-1]
         return active
 
     #################### context menu ####################
@@ -755,6 +801,7 @@ class MonitorWidget(Gtk.DrawingArea):
                 self._xrandr.configuration.splits.pop(output_name, None)
             else:
                 self._xrandr.configuration.splits[output_name] = tree
+            self._sync_monitors()
             self._force_repaint()
             self.emit('changed')
 
@@ -762,6 +809,7 @@ class MonitorWidget(Gtk.DrawingArea):
 
     def _on_remove_splits(self, menuitem, output_name):
         self._xrandr.configuration.splits.pop(output_name, None)
+        self._sync_monitors()
         self._force_repaint()
         self.emit('changed')
 
@@ -825,6 +873,7 @@ class MonitorWidget(Gtk.DrawingArea):
         self._xrandr.configuration.outputs[
             self._draggingoutput
         ].tentative_position = self._draggingsnap.suggest(newpos)
+        self._sync_monitors()
         self._force_repaint()
 
         return True
@@ -850,4 +899,5 @@ class MonitorWidget(Gtk.DrawingArea):
             pass
         self._draggingoutput = None
         self._draggingfrom = None
+        self._sync_monitors()
         self._force_repaint()

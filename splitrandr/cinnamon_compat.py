@@ -14,6 +14,7 @@ disables the csd-xrandr settings daemon plugin to prevent it from
 reverting our changes.
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -85,16 +86,28 @@ def _is_cinnamon_running():
 
 
 def _get_cinnamon_pid():
-    """Get the PID of the cinnamon process."""
+    """Get the PID of the live (non-zombie) cinnamon process."""
     try:
         result = subprocess.run(
             ['pgrep', '-x', 'cinnamon'],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
-            pids = result.stdout.strip().split('\n')
-            if pids and pids[0]:
-                return int(pids[0])
+            for line in result.stdout.strip().split('\n'):
+                pid_str = line.strip()
+                if not pid_str:
+                    continue
+                pid = int(pid_str)
+                # Skip zombie processes (state 'Z')
+                try:
+                    with open('/proc/%d/status' % pid) as f:
+                        for sline in f:
+                            if sline.startswith('State:'):
+                                if 'Z' in sline:
+                                    break
+                                return pid
+                except (OSError, PermissionError):
+                    pass
     except Exception:
         pass
     return None
@@ -163,6 +176,100 @@ def _wait_cinnamon_on_dbus(timeout=15.0):
         return True
 
     return False
+
+
+def _cinnamon_eval(expr):
+    """Run a JS expression via org.Cinnamon.Eval and return the string result.
+
+    Eval JSON-stringifies the return value, so callers receive the JSON text.
+    For simple values (numbers, booleans), this is just the literal (e.g. '2').
+    For objects/arrays, it's a JSON string (e.g. '[{"x":0}]').
+
+    Returns the result string on success, or None on failure.
+    """
+    try:
+        result = subprocess.run(
+            ['gdbus', 'call', '--session',
+             '--dest', 'org.Cinnamon',
+             '--object-path', '/org/Cinnamon',
+             '--method', 'org.Cinnamon.Eval',
+             expr],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        # Output format: (true, 'value')  or  (false, 'error')
+        out = result.stdout.strip()
+        if not out.startswith('(true,'):
+            return None
+        # Extract the GVariant string between single quotes
+        start = out.index("'") + 1
+        end = out.rindex("'")
+        raw = out[start:end]
+        # Unescape GVariant string format: \\ → \, \' → '
+        chars = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == '\\' and i + 1 < len(raw):
+                chars.append(raw[i + 1])
+                i += 2
+            else:
+                chars.append(raw[i])
+                i += 1
+        return ''.join(chars)
+    except Exception as e:
+        log.debug("cinnamon eval failed for %r: %s", expr, e)
+        return None
+
+
+def query_cinnamon_monitors():
+    """Query Cinnamon's compositor for the actual monitor layout via DBUS.
+
+    Returns a list of dicts on success:
+        [{"name": "Samsung ...", "x": 0, "y": 0,
+          "width": 3840, "height": 2160, "primary": False, "scale": 1}, ...]
+
+    Returns None if Cinnamon is not running or DBUS query fails.
+    """
+    if not _is_cinnamon_running():
+        return None
+
+    # Single DBUS call: query all monitor data at once.
+    # Don't use JSON.stringify — Eval already JSON-serializes the return value.
+    js = (
+        '(function() {'
+        '  var n = global.display.get_n_monitors();'
+        '  if (n <= 0) return [];'
+        '  var p = global.display.get_primary_monitor();'
+        '  var r = [];'
+        '  for (var i = 0; i < n; i++) {'
+        '    var g = global.display.get_monitor_geometry(i);'
+        '    var name = "";'
+        '    try { name = global.display.get_monitor_name(i); } catch(e) {}'
+        '    var scale = 1;'
+        '    try { scale = global.display.get_monitor_scale(i); } catch(e) {}'
+        '    r.push({name: name, x: g.x, y: g.y,'
+        '            width: g.width, height: g.height,'
+        '            primary: (i === p), scale: scale});'
+        '  }'
+        '  return r;'
+        '})()'
+    )
+    result_str = _cinnamon_eval(js)
+    if result_str is None:
+        return None
+
+    try:
+        monitors = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("failed to parse Cinnamon monitor JSON: %r", result_str)
+        return None
+
+    if not isinstance(monitors, list) or len(monitors) == 0:
+        return None
+
+    log.info("queried %d monitors from Cinnamon DBUS", len(monitors))
+    return monitors
 
 
 def is_setmonitor_affected():
