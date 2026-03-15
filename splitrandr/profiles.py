@@ -62,7 +62,10 @@ def list_profiles():
 
 
 def profile_path(name):
-    return os.path.join(PROFILES_DIR, name + '.json')
+    path = os.path.join(PROFILES_DIR, name + '.json')
+    if os.path.commonpath([PROFILES_DIR, os.path.normpath(path)]) != PROFILES_DIR:
+        raise ValueError("invalid profile name: %r" % name)
+    return path
 
 
 def save_profile(name, config_dict):

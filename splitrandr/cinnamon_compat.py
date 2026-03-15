@@ -113,6 +113,15 @@ def _get_cinnamon_pid():
     return None
 
 
+def _pid_is_cinnamon(pid):
+    """Check that a PID still belongs to a cinnamon process."""
+    try:
+        with open('/proc/%d/comm' % pid) as f:
+            return f.read().strip() == 'cinnamon'
+    except (OSError, PermissionError):
+        return False
+
+
 def _poll_until(predicate, timeout, interval=0.1, description=""):
     """Poll predicate() until it returns True or timeout expires.
 
@@ -358,7 +367,7 @@ class CinnamonSetMonitorGuard:
 
         # Step 2: SIGSTOP Cinnamon
         self._cinnamon_pid = _get_cinnamon_pid()
-        if self._cinnamon_pid:
+        if self._cinnamon_pid and _pid_is_cinnamon(self._cinnamon_pid):
             log.info("freezing Cinnamon (PID %d) for setmonitor safety", self._cinnamon_pid)
             try:
                 os.kill(self._cinnamon_pid, signal.SIGSTOP)
@@ -382,11 +391,15 @@ class CinnamonSetMonitorGuard:
                 )
             except Exception:
                 time.sleep(0.2)  # fallback
-            log.info("resuming Cinnamon (PID %d)", self._cinnamon_pid)
-            try:
-                os.kill(self._cinnamon_pid, signal.SIGCONT)
-            except OSError as e:
-                log.warning("failed to SIGCONT Cinnamon: %s", e)
+            if _pid_is_cinnamon(self._cinnamon_pid):
+                log.info("resuming Cinnamon (PID %d)", self._cinnamon_pid)
+                try:
+                    os.kill(self._cinnamon_pid, signal.SIGCONT)
+                except OSError as e:
+                    log.warning("failed to SIGCONT Cinnamon: %s", e)
+            else:
+                log.warning("PID %d is no longer Cinnamon, skipping SIGCONT",
+                           self._cinnamon_pid)
 
         # Step 4: Optionally re-enable csd-xrandr
         if self._re_enable_csd and self._csd_was_active:

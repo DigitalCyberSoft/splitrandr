@@ -16,7 +16,7 @@ import subprocess
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, Gio
 
 from . import widget
 from . import profiles
@@ -26,6 +26,135 @@ from .i18n import _
 from .meta import (
     __version__, TRANSLATORS, COPYRIGHT, PROGRAMNAME, PROGRAMDESCRIPTION,
 )
+
+
+import logging as _logging
+_sw_log = _logging.getLogger('splitrandr.screenwatcher')
+
+
+class ScreenWatcher:
+    """Watch for screen unlock and system wake events, re-apply layout.
+
+    Listens on D-Bus for:
+    - org.cinnamon.ScreenSaver ActiveChanged (Cinnamon lock/unlock)
+    - org.freedesktop.ScreenSaver ActiveChanged (freedesktop lock/unlock)
+    - org.gnome.ScreenSaver ActiveChanged (GNOME lock/unlock)
+    - org.freedesktop.login1.Session Lock/Unlock (logind session)
+    - org.freedesktop.login1.Manager PrepareForSleep (suspend/wake)
+
+    Multiple signals firing in close succession are debounced into a
+    single re-apply after REAPPLY_DELAY_SECS.
+    """
+
+    REAPPLY_DELAY_SECS = 3
+
+    def __init__(self):
+        self._subscriptions = []
+        self._pending_reapply = None
+        self._setup_session_bus()
+        self._setup_system_bus()
+
+    def _sub(self, bus, sender, iface, signal, path):
+        sub_id = bus.signal_subscribe(
+            sender, iface, signal, path, None,
+            Gio.DBusSignalFlags.NONE, self._on_signal)
+        self._subscriptions.append((bus, sub_id))
+
+    def _setup_session_bus(self):
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception as e:
+            _sw_log.warning("session bus unavailable: %s", e)
+            return
+        for svc, iface, path in [
+            ('org.cinnamon.ScreenSaver',
+             'org.cinnamon.ScreenSaver',
+             '/org/cinnamon/ScreenSaver'),
+            ('org.freedesktop.ScreenSaver',
+             'org.freedesktop.ScreenSaver',
+             '/org/freedesktop/ScreenSaver'),
+            ('org.gnome.ScreenSaver',
+             'org.gnome.ScreenSaver',
+             '/org/gnome/ScreenSaver'),
+        ]:
+            self._sub(bus, svc, iface, 'ActiveChanged', path)
+            _sw_log.info("subscribed to %s.ActiveChanged", iface)
+
+    def _setup_system_bus(self):
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except Exception as e:
+            _sw_log.warning("system bus unavailable: %s", e)
+            return
+
+        # Suspend/wake
+        self._sub(bus, 'org.freedesktop.login1',
+                  'org.freedesktop.login1.Manager',
+                  'PrepareForSleep', '/org/freedesktop/login1')
+        _sw_log.info("subscribed to logind PrepareForSleep")
+
+        # Session Lock/Unlock
+        try:
+            result = bus.call_sync(
+                'org.freedesktop.login1',
+                '/org/freedesktop/login1',
+                'org.freedesktop.login1.Manager',
+                'GetSessionByPID',
+                GLib.Variant('(u)', (os.getpid(),)),
+                GLib.VariantType('(o)'),
+                Gio.DBusCallFlags.NONE, -1, None)
+            session_path = result.unpack()[0]
+            for sig in ('Lock', 'Unlock'):
+                self._sub(bus, 'org.freedesktop.login1',
+                          'org.freedesktop.login1.Session',
+                          sig, session_path)
+            _sw_log.info("subscribed to logind session Lock/Unlock at %s",
+                         session_path)
+        except Exception as e:
+            _sw_log.warning("logind session subscription failed: %s", e)
+
+    def _on_signal(self, conn, sender, path, iface, signal, params):
+        if signal == 'ActiveChanged':
+            active = params.unpack()[0]
+            if not active:
+                _sw_log.info("screen unlocked via %s", iface)
+                self._schedule_reapply()
+        elif signal == 'PrepareForSleep':
+            going_to_sleep = params.unpack()[0]
+            if not going_to_sleep:
+                _sw_log.info("system waking from sleep")
+                self._schedule_reapply()
+        elif signal == 'Unlock':
+            _sw_log.info("session unlocked via logind")
+            self._schedule_reapply()
+
+    def _schedule_reapply(self):
+        if self._pending_reapply is not None:
+            GLib.source_remove(self._pending_reapply)
+        self._pending_reapply = GLib.timeout_add_seconds(
+            self.REAPPLY_DELAY_SECS, self._do_reapply)
+
+    def _do_reapply(self):
+        self._pending_reapply = None
+        active = profiles.get_active_profile()
+        if not active:
+            _sw_log.info("no active profile, skipping re-apply")
+            return False
+        _sw_log.info("re-applying profile '%s'", active)
+        try:
+            profiles.apply_profile(active)
+            _sw_log.info("profile '%s' re-applied successfully", active)
+        except Exception as e:
+            _sw_log.warning("failed to re-apply profile '%s': %s", active, e)
+        return False
+
+    def destroy(self):
+        if self._pending_reapply is not None:
+            GLib.source_remove(self._pending_reapply)
+            self._pending_reapply = None
+        for bus, sub_id in self._subscriptions:
+            bus.signal_unsubscribe(sub_id)
+        self._subscriptions.clear()
 
 
 class Application:
@@ -92,6 +221,9 @@ class Application:
         # Start tray if enabled
         if profiles.get_setting('tray_enabled', 'false') == 'true':
             self._start_tray()
+
+        # Watch for screen unlock / wake to re-apply layout
+        self._screen_watcher = ScreenWatcher()
 
         # Initial control state
         self._update_controls_for_selection()
@@ -785,9 +917,8 @@ class Application:
             # Clear fakexrandr config so xrandr sees real physical outputs
             try:
                 from .fakexrandr_config import CONFIG_PATH
-                if os.path.exists(CONFIG_PATH):
-                    os.remove(CONFIG_PATH)
-            except Exception:
+                os.remove(CONFIG_PATH)
+            except FileNotFoundError:
                 pass
             subprocess.run(['sh', '-c', revert_script], timeout=30)
             self.widget.load_from_x()
@@ -1004,6 +1135,8 @@ class Application:
         return False
 
     def _do_quit(self, *_args):
+        if hasattr(self, '_screen_watcher'):
+            self._screen_watcher.destroy()
         Gtk.main_quit()
 
     #################### about ####################
@@ -1067,8 +1200,17 @@ def main():
         help='Write fakexrandr.bin and cinnamon-monitors.xml from current X state, then exit',
         action='store_true'
     )
+    parser.add_option(
+        '--watch',
+        help='Run headless, re-applying active profile on screen unlock or wake from suspend',
+        action='store_true'
+    )
 
     (options, args) = parser.parse_args()
+
+    if options.watch:
+        _run_watch()
+        return
 
     if options.apply:
         json_path = args[0] if args else Application.LAYOUT_JSON
@@ -1088,6 +1230,22 @@ def main():
         force_version=options.force_version
     )
     app.run()
+
+
+def _run_watch():
+    """Run headless screen watcher that re-applies layout on unlock/wake."""
+    watcher = ScreenWatcher()
+    active = profiles.get_active_profile()
+    if active:
+        print("Watching for screen events, will re-apply profile '%s'" % active)
+    else:
+        print("Watching for screen events (no active profile yet)")
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    watcher.destroy()
 
 
 def _apply_config(json_path):

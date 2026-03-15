@@ -11,6 +11,7 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import warnings
@@ -592,8 +593,8 @@ class XRandR:
                 w_mm, h_mm, border
             )
             for mon_name, geom, out in commands:
-                del_lines.append("env -u LD_PRELOAD xrandr --delmonitor %s 2>/dev/null || true" % mon_name)
-                set_lines.append("env -u LD_PRELOAD xrandr --setmonitor %s %s %s" % (mon_name, geom, out))
+                del_lines.append("env -u LD_PRELOAD xrandr --delmonitor %s 2>/dev/null || true" % shlex.quote(mon_name))
+                set_lines.append("env -u LD_PRELOAD xrandr --setmonitor %s %s %s" % (shlex.quote(mon_name), shlex.quote(geom), shlex.quote(out)))
 
         # Generate setmonitor for unsplit outputs that have a border
         for output_name, border_val in self.configuration.borders.items():
@@ -611,8 +612,8 @@ class XRandR:
             bh = max(h - 2 * border_val, 1)
             mon_name = "%s~0" % output_name
             geom = "%d/%dx%d/%d+%d+%d" % (bw, w_mm, bh, h_mm, ox + border_val, oy + border_val)
-            del_lines.append("env -u LD_PRELOAD xrandr --delmonitor %s 2>/dev/null || true" % mon_name)
-            set_lines.append("env -u LD_PRELOAD xrandr --setmonitor %s %s %s" % (mon_name, geom, output_name))
+            del_lines.append("env -u LD_PRELOAD xrandr --delmonitor %s 2>/dev/null || true" % shlex.quote(mon_name))
+            set_lines.append("env -u LD_PRELOAD xrandr --setmonitor %s %s %s" % (shlex.quote(mon_name), shlex.quote(geom), shlex.quote(output_name)))
 
         # Generate border comments for persistence
         border_comments = []
@@ -663,7 +664,7 @@ class XRandR:
         data = {
             'pre_commands': '\n'.join(pre_cmds) if pre_cmds else '',
             'clear_fakexrandr': clear_fakexrandr,
-            'xrandr': "xrandr " + " ".join(self.configuration.commandlineargs()),
+            'xrandr': "xrandr " + " ".join(shlex.quote(a) for a in self.configuration.commandlineargs()),
             'delmonitors': '\n'.join(del_lines),
             'setmonitors': '\n'.join(set_lines),
             'cinnamon_safe_setmonitors': cinnamon_safe,
@@ -762,9 +763,11 @@ class XRandR:
             # through, restoring the real DP-5 for the commands below.
             try:
                 from .fakexrandr_config import CONFIG_PATH
-                if os.path.exists(CONFIG_PATH):
+                try:
                     os.remove(CONFIG_PATH)
                     log.info("cleared fakexrandr config to expose real outputs")
+                except FileNotFoundError:
+                    pass
             except Exception as e:
                 log.warning("failed to clear fakexrandr config: %s", e)
 
@@ -896,9 +899,8 @@ class XRandR:
                     with CinnamonSetMonitorGuard():
                         # Clear fakexrandr config so xrandr sees real outputs
                         try:
-                            if os.path.exists(CONFIG_PATH):
-                                os.remove(CONFIG_PATH)
-                        except Exception:
+                            os.remove(CONFIG_PATH)
+                        except FileNotFoundError:
                             pass
 
                         log.info("re-applying xrandr config after Cinnamon restart")
@@ -999,9 +1001,8 @@ class XRandR:
             with CinnamonSetMonitorGuard():
                 try:
                     from .fakexrandr_config import CONFIG_PATH
-                    if os.path.exists(CONFIG_PATH):
-                        os.remove(CONFIG_PATH)
-                except Exception:
+                    os.remove(CONFIG_PATH)
+                except FileNotFoundError:
                     pass
                 self._run(*self.configuration.commandlineargs())
                 self._verify_and_correct_positions(max_attempts=3, delay=0.5)

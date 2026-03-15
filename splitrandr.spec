@@ -1,5 +1,5 @@
 Name:           splitrandr
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Monitor Layout Editor with Virtual Monitor Splitting
 

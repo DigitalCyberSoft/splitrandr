@@ -195,9 +195,8 @@ class SplitRandRTray:
             # Clear fakexrandr config so xrandr sees real physical outputs
             try:
                 from .fakexrandr_config import CONFIG_PATH
-                if os.path.exists(CONFIG_PATH):
-                    os.remove(CONFIG_PATH)
-            except Exception:
+                os.remove(CONFIG_PATH)
+            except FileNotFoundError:
                 pass
             subprocess.Popen(['sh', '-c', revert_script])
             profiles.set_active_profile(previous_active)
