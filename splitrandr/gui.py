@@ -140,6 +140,9 @@ class ScreenWatcher:
         if not active:
             _sw_log.info("no active profile, skipping re-apply")
             return False
+        if self._layout_matches(active):
+            _sw_log.info("layout already correct, skipping re-apply")
+            return False
         _sw_log.info("re-applying profile '%s'", active)
         try:
             profiles.apply_profile(active)
@@ -147,6 +150,80 @@ class ScreenWatcher:
         except Exception as e:
             _sw_log.warning("failed to re-apply profile '%s': %s", active, e)
         return False
+
+    @staticmethod
+    def _layout_matches(profile_name):
+        """Check if current X layout matches the profile without modifying anything."""
+        import json, re, subprocess
+        try:
+            path = profiles.profile_path(profile_name)
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            return False
+
+        expected_outputs = data.get('outputs', {})
+        expected_splits = data.get('splits', {})
+
+        # Query current output positions and modes
+        try:
+            raw = subprocess.run(
+                ['xrandr', '--query'],
+                capture_output=True, text=True, timeout=5
+            ).stdout
+        except Exception:
+            return False
+
+        current = {}
+        for line in raw.split('\n'):
+            if line.startswith(('\t', ' ', 'Screen')):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            name = parts[0]
+            for p in parts[2:]:
+                m = re.match(r'(\d+)x(\d+)\+(\d+)\+(\d+)', p)
+                if m:
+                    current[name] = (
+                        int(m.group(1)), int(m.group(2)),
+                        int(m.group(3)), int(m.group(4)),
+                    )
+                    break
+
+        # Check each expected output's position and mode size.
+        # Skip split outputs — fakexrandr hides the physical output
+        # (e.g. DP-5 becomes DP-5~1/~2/~3), so it won't appear in
+        # xrandr --query.  Those are validated by the virtual monitor
+        # existence check below.
+        for name, out_data in expected_outputs.items():
+            if not out_data.get('active'):
+                continue
+            if name in expected_splits and expected_splits[name].get('d'):
+                continue
+            pos = out_data.get('position', [0, 0])
+            mode = out_data.get('mode', '')
+            try:
+                mw, mh = mode.split('x')
+                expected = (int(mw), int(mh), pos[0], pos[1])
+            except (ValueError, AttributeError):
+                return False
+            if current.get(name) != expected:
+                _sw_log.info("mismatch on %s: expected %s, got %s",
+                            name, expected, current.get(name))
+                return False
+
+        # Check virtual outputs exist if splits are configured.
+        # fakexrandr replaces e.g. DP-5 with DP-5~1/~2/~3 in --query
+        # output, so check the raw output we already fetched.
+        for output_name, tree_data in expected_splits.items():
+            if tree_data.get('d'):  # non-leaf = has splits
+                if output_name + '~' not in raw:
+                    _sw_log.info("virtual outputs missing for %s",
+                                output_name)
+                    return False
+
+        return True
 
     def destroy(self):
         if self._pending_reapply is not None:
