@@ -51,8 +51,10 @@ class ScreenWatcher:
     def __init__(self):
         self._subscriptions = []
         self._pending_reapply = None
+        self._screen_signal_id = None
         self._setup_session_bus()
         self._setup_system_bus()
+        self._setup_randr_monitor()
 
     def _sub(self, bus, sender, iface, signal, path):
         sub_id = bus.signal_subscribe(
@@ -112,6 +114,23 @@ class ScreenWatcher:
                          session_path)
         except Exception as e:
             _sw_log.warning("logind session subscription failed: %s", e)
+
+    def _setup_randr_monitor(self):
+        """Watch for display hotplug events (monitor power loss/return)."""
+        try:
+            screen = Gdk.Screen.get_default()
+            if screen:
+                self._screen_signal_id = screen.connect(
+                    'monitors-changed', self._on_monitors_changed)
+                _sw_log.info("subscribed to Gdk monitors-changed")
+            else:
+                _sw_log.warning("no default GDK screen, skipping RandR monitor")
+        except Exception as e:
+            _sw_log.warning("GDK monitors-changed subscription failed: %s", e)
+
+    def _on_monitors_changed(self, screen):
+        _sw_log.info("display configuration changed (hotplug/power event)")
+        self._schedule_reapply()
 
     def _on_signal(self, conn, sender, path, iface, signal, params):
         if signal == 'ActiveChanged':
@@ -232,6 +251,11 @@ class ScreenWatcher:
         for bus, sub_id in self._subscriptions:
             bus.signal_unsubscribe(sub_id)
         self._subscriptions.clear()
+        if self._screen_signal_id is not None:
+            screen = Gdk.Screen.get_default()
+            if screen:
+                screen.disconnect(self._screen_signal_id)
+            self._screen_signal_id = None
 
 
 class Application:
@@ -1311,6 +1335,8 @@ def main():
 
 def _run_watch():
     """Run headless screen watcher that re-applies layout on unlock/wake."""
+    # Initialize GDK so Gdk.Screen monitors-changed signals work
+    Gdk.init([])
     watcher = ScreenWatcher()
     active = profiles.get_active_profile()
     if active:
