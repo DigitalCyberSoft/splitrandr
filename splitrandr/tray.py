@@ -16,7 +16,7 @@ import subprocess
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, Gdk, GLib
 
 from . import profiles
 from .i18n import _
@@ -172,8 +172,14 @@ class SplitRandRTray:
         dialog.add_button(_("Revert Settings"), Gtk.ResponseType.REJECT)
         dialog.add_button(_("Keep Changes"), Gtk.ResponseType.ACCEPT)
         dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+        dialog.set_keep_above(True)
 
         secondary_label = dialog.get_message_area().get_children()[1]
+
+        def _raise():
+            dialog.present_with_time(Gdk.CURRENT_TIME)
+            return False
+        GLib.idle_add(_raise)
 
         def tick():
             state['remaining'] -= 1

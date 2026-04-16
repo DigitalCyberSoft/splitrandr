@@ -991,8 +991,20 @@ class Application:
         dialog.add_button(_("Revert Settings"), Gtk.ResponseType.REJECT)
         dialog.add_button(_("Keep Changes"), Gtk.ResponseType.ACCEPT)
         dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+        dialog.set_keep_above(True)
 
         secondary_label = dialog.get_message_area().get_children()[1]
+
+        # Raise the main window and dialog above other windows.
+        # After save_to_x() resets the display, the WM restacks
+        # everything and the dialog ends up behind other windows.
+        # Done via idle_add so it runs inside dialog.run()'s main loop
+        # after the dialog has been properly mapped.
+        def _raise():
+            self.window.present_with_time(Gdk.CURRENT_TIME)
+            dialog.present_with_time(Gdk.CURRENT_TIME)
+            return False
+        GLib.idle_add(_raise)
 
         def tick():
             state['remaining'] -= 1
