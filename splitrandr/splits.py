@@ -32,6 +32,7 @@ class SplitTree:
         self.proportion = proportion
         self.left = left or SplitTree.__new_leaf()
         self.right = right or SplitTree.__new_leaf()
+        self.primary = False  # only meaningful for leaves
 
     @staticmethod
     def __new_leaf():
@@ -40,6 +41,7 @@ class SplitTree:
         t.proportion = 0.5
         t.left = None
         t.right = None
+        t.primary = False
         return t
 
     @staticmethod
@@ -108,38 +110,63 @@ class SplitTree:
                 return self.right.get_split_for_point(
                     px, py, x, split_y, w, h * (1 - self.proportion))
 
-    def find_nearest_edge(self, px, py, x=0.0, y=0.0, w=1.0, h=1.0, threshold=0.03):
+    def find_nearest_edge(self, px, py, x=0.0, y=0.0, w=1.0, h=1.0,
+                          threshold_px=8, canvas_w=1.0, canvas_h=1.0):
         """Find the nearest split edge to point (px, py) in proportional space.
-        Returns (node, parent, is_left_child, distance) or None."""
+        Distance is measured in pixels (using canvas_w/canvas_h to scale)
+        so the grab radius is uniform regardless of the canvas aspect ratio.
+        Returns (node, parent, is_left_child, distance_px) or None."""
         results = []
-        self._collect_edges(px, py, x, y, w, h, None, True, results)
+        self._collect_edges(
+            px, py, x, y, w, h, canvas_w, canvas_h, None, True, results)
         if not results:
             return None
         results.sort(key=lambda r: r[3])
-        if results[0][3] < threshold:
+        if results[0][3] < threshold_px:
             return results[0]
         return None
 
-    def _collect_edges(self, px, py, x, y, w, h, parent, is_left, results):
+    def _collect_edges(self, px, py, x, y, w, h, cw, ch, parent, is_left, results):
         if self.is_leaf:
             return
 
         if self.direction == 'V':
             edge_x = x + w * self.proportion
             if y <= py <= y + h:
-                dist = abs(px - edge_x)
+                dist = abs(px - edge_x) * cw
                 results.append((self, parent, is_left, dist))
-            self.left._collect_edges(px, py, x, y, w * self.proportion, h, self, True, results)
+            self.left._collect_edges(
+                px, py, x, y, w * self.proportion, h, cw, ch, self, True, results)
             self.right._collect_edges(
-                px, py, edge_x, y, w * (1 - self.proportion), h, self, False, results)
+                px, py, edge_x, y, w * (1 - self.proportion), h, cw, ch,
+                self, False, results)
         else:
             edge_y = y + h * self.proportion
             if x <= px <= x + w:
-                dist = abs(py - edge_y)
+                dist = abs(py - edge_y) * ch
                 results.append((self, parent, is_left, dist))
-            self.left._collect_edges(px, py, x, y, w, h * self.proportion, self, True, results)
+            self.left._collect_edges(
+                px, py, x, y, w, h * self.proportion, cw, ch, self, True, results)
             self.right._collect_edges(
-                px, py, x, edge_y, w, h * (1 - self.proportion), self, False, results)
+                px, py, x, edge_y, w, h * (1 - self.proportion), cw, ch,
+                self, False, results)
+
+    def find_node_region(self, target, x=0.0, y=0.0, w=1.0, h=1.0):
+        """Return the proportional (x, y, w, h) region of a target node, or None."""
+        if self is target:
+            return (x, y, w, h)
+        if self.is_leaf:
+            return None
+        if self.direction == 'V':
+            left_w = w * self.proportion
+            return (self.left.find_node_region(target, x, y, left_w, h)
+                    or self.right.find_node_region(
+                        target, x + left_w, y, w - left_w, h))
+        else:
+            top_h = h * self.proportion
+            return (self.left.find_node_region(target, x, y, w, top_h)
+                    or self.right.find_node_region(
+                        target, x, y + top_h, w, h - top_h))
 
     def to_setmonitor_commands(self, output_name, width, height, x_off, y_off, w_mm, h_mm, border=0):
         """Generate xrandr --setmonitor argument lists.
@@ -232,7 +259,8 @@ class SplitTree:
 
     def to_dict(self):
         if self.is_leaf:
-            return None
+            # Leaves only need to round-trip if they carry state.
+            return {'primary': True} if self.primary else None
         return {'d': self.direction, 'p': self.proportion,
                 'l': self.left.to_dict(), 'r': self.right.to_dict()}
 
@@ -240,15 +268,55 @@ class SplitTree:
     def from_dict(d):
         if d is None:
             return SplitTree.new_leaf()
-        return SplitTree(d['d'], d['p'],
+        if 'd' not in d:
+            # Leaf payload (e.g. {'primary': True})
+            leaf = SplitTree.new_leaf()
+            leaf.primary = bool(d.get('primary', False))
+            return leaf
+        node = SplitTree(d['d'], d['p'],
                          SplitTree.from_dict(d['l']),
                          SplitTree.from_dict(d['r']))
+        return node
 
     def copy(self):
         if self.is_leaf:
-            return SplitTree.new_leaf()
+            leaf = SplitTree.new_leaf()
+            leaf.primary = self.primary
+            return leaf
         return SplitTree(self.direction, self.proportion,
                          self.left.copy(), self.right.copy())
+
+    def iter_leaves(self):
+        """Yield (index, leaf) in spatial enumeration order — same order as
+        leaf_regions, leaf_regions_proportional, and the ~N naming convention."""
+        idx = [0]
+
+        def walk(node):
+            if node.is_leaf:
+                yield (idx[0], node)
+                idx[0] += 1
+                return
+            yield from walk(node.left)
+            yield from walk(node.right)
+
+        yield from walk(self)
+
+    def primary_leaf_index(self):
+        """Return the spatial index of the leaf with primary=True, or None."""
+        for i, leaf in self.iter_leaves():
+            if leaf.primary:
+                return i
+        return None
+
+    def clear_primary(self):
+        """Unset primary on all leaves."""
+        for _, leaf in self.iter_leaves():
+            leaf.primary = False
+
+    def set_primary_at(self, index):
+        """Set primary on the leaf at the given spatial index, clearing others."""
+        for i, leaf in self.iter_leaves():
+            leaf.primary = (i == index)
 
 
 class SplitEditorDialog(Gtk.Dialog):
@@ -286,11 +354,17 @@ class SplitEditorDialog(Gtk.Dialog):
         self._drag_target_edge = None
         self._drag_decision = None  # 'H', 'V', or None
 
+        # Undo history: stack of tree snapshots taken BEFORE each
+        # mutating operation (split-creation, edge-resize, edge-removal).
+        # Most-recent state is at the top of the stack.
+        self._undo_stack = []
+
         content = self.get_content_area()
 
         label = Gtk.Label()
         label.set_markup(
-            "<small>Drag to split. Right-click a split line to remove.</small>"
+            "<small>Drag inside a region to split it. Drag an existing line "
+            "to resize. Right-click a line to remove. Ctrl+Z to undo.</small>"
         )
         label.set_margin_top(6)
         label.set_margin_bottom(6)
@@ -316,7 +390,48 @@ class SplitEditorDialog(Gtk.Dialog):
         frame.set_margin_bottom(12)
         content.pack_start(frame, False, False, 0)
 
+        # Undo + Reset buttons. Reset clears all splits back to a single
+        # leaf — equivalent to undoing every operation.
+        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        button_row.set_margin_start(12)
+        button_row.set_margin_end(12)
+        button_row.set_margin_bottom(12)
+        self._undo_button = Gtk.Button(label="Undo")
+        self._undo_button.set_sensitive(False)
+        self._undo_button.connect("clicked", lambda b: self._undo())
+        button_row.pack_start(self._undo_button, False, False, 0)
+        reset_button = Gtk.Button(label="Reset (no splits)")
+        reset_button.connect("clicked", lambda b: self._reset_tree())
+        button_row.pack_start(reset_button, False, False, 0)
+        content.pack_start(button_row, False, False, 0)
+
+        # Ctrl+Z keyboard accelerator
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+        accel.connect(
+            Gdk.KEY_z, Gdk.ModifierType.CONTROL_MASK, 0,
+            lambda *a: (self._undo(), True)[1]
+        )
+
         content.show_all()
+
+    def _push_undo(self):
+        """Snapshot the current tree before a mutating operation."""
+        self._undo_stack.append(self._tree.copy())
+        self._undo_button.set_sensitive(True)
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._tree = self._undo_stack.pop()
+        self._undo_button.set_sensitive(bool(self._undo_stack))
+        self._drawing_area.queue_draw()
+
+    def _reset_tree(self):
+        """Replace the tree with a single leaf, pushing the prior state to undo."""
+        self._push_undo()
+        self._tree = SplitTree.new_leaf()
+        self._drawing_area.queue_draw()
 
     @property
     def split_tree(self):
@@ -419,20 +534,34 @@ class SplitEditorDialog(Gtk.Dialog):
         snapped = round(prop / step) * step
         return max(0.1, min(0.9, snapped))
 
-    def _on_button_press(self, widget, event):
-        px, py = self._px_to_prop(event.x, event.y)
+    GRAB_RADIUS_PX = 8  # how close (in canvas pixels) you have to click to grab an edge
 
+    def _find_edge_at(self, event_x, event_y):
+        px, py = self._px_to_prop(event_x, event_y)
+        return self._tree.find_nearest_edge(
+            px, py,
+            threshold_px=self.GRAB_RADIUS_PX,
+            canvas_w=self.CANVAS_WIDTH, canvas_h=self._canvas_height,
+        )
+
+    def _on_button_press(self, widget, event):
         if event.button == 3:
-            # Right-click: remove nearest edge
-            edge = self._tree.find_nearest_edge(px, py, threshold=0.05)
+            # Right-click: remove nearest edge.  Convert that subtree
+            # back to a single leaf — discards both children.  The
+            # earlier "promote-left-subtree" implementation preserved
+            # nested splits when removing an outer edge, which was
+            # confusing; users right-clicking a line expect that
+            # entire split level to vanish, not for a child split to
+            # take its place.
+            edge = self._find_edge_at(event.x, event.y)
             if edge:
                 node, parent, is_left, dist = edge
-                # Replace node with its left child (promote left subtree)
-                node.direction = node.left.direction
-                node.proportion = node.left.proportion
-                old_left = node.left
-                node.right = old_left.right
-                node.left = old_left.left
+                self._push_undo()
+                node.direction = None
+                node.proportion = 0.5
+                node.left = None
+                node.right = None
+                node.primary = False
                 self._drawing_area.queue_draw()
             return
 
@@ -441,13 +570,22 @@ class SplitEditorDialog(Gtk.Dialog):
             self._drag_decision = None
 
             # Check if near an existing edge to move it
-            edge = self._tree.find_nearest_edge(px, py, threshold=0.04)
+            edge = self._find_edge_at(event.x, event.y)
             if edge:
                 self._drag_mode = 'move_edge'
                 self._drag_target_edge = edge[0]  # the split node
+                # Snapshot before resize starts (motion events will mutate
+                # node.proportion in place; pushing once at drag start
+                # gives the user a single Undo to revert the whole drag).
+                self._push_undo()
                 return
 
-            # Otherwise, prepare for new split
+            # Otherwise, prepare for new split.  Undo snapshot is taken
+            # later in the motion handler when the drag actually
+            # crosses the threshold and the leaf gets converted into
+            # a split — clicking without dragging mustn't pollute the
+            # undo stack.
+            px, py = self._px_to_prop(event.x, event.y)
             self._drag_mode = 'new_split'
             result = self._tree.get_split_for_point(px, py)
             self._drag_target_leaf = result[0]  # the leaf node
@@ -461,6 +599,8 @@ class SplitEditorDialog(Gtk.Dialog):
 
     def _on_motion(self, widget, event):
         if not self._mouse_down_at:
+            # Hover feedback: change cursor when over a draggable edge.
+            self._update_hover_cursor(event.x, event.y)
             return
 
         if self._drag_mode == 'move_edge':
@@ -468,7 +608,7 @@ class SplitEditorDialog(Gtk.Dialog):
             if node is None:
                 return
             px, py = self._px_to_prop(event.x, event.y)
-            region = self._find_node_region(self._tree, node, 0.0, 0.0, 1.0, 1.0)
+            region = self._tree.find_node_region(node)
             if node.direction == 'V':
                 if region:
                     rx, ry, rw, rh = region
@@ -501,6 +641,10 @@ class SplitEditorDialog(Gtk.Dialog):
                     self._drag_decision = 'H'  # horizontal drag = vertical split line
                 elif ydiff > threshold:
                     self._drag_decision = 'V'  # vertical drag = horizontal split line
+                if self._drag_decision is not None:
+                    # Snapshot the tree before turning this leaf into a
+                    # split.  One push covers the whole drag.
+                    self._push_undo()
 
             if self._drag_decision is not None:
                 px, py = self._px_to_prop(event.x, event.y)
@@ -530,24 +674,16 @@ class SplitEditorDialog(Gtk.Dialog):
 
                 self._drawing_area.queue_draw()
 
-    def _find_node_region(self, current, target, x, y, w, h):
-        """Find the (x, y, w, h) region of a target node within the tree."""
-        if current is target:
-            return (x, y, w, h)
-        if current.is_leaf:
-            return None
-
-        if current.direction == 'V':
-            left_w = w * current.proportion
-            result = self._find_node_region(current.left, target, x, y, left_w, h)
-            if result:
-                return result
-            return self._find_node_region(
-                current.right, target, x + left_w, y, w - left_w, h)
+    def _update_hover_cursor(self, ex, ey):
+        edge = self._find_edge_at(ex, ey)
+        win = self._drawing_area.get_window()
+        if not win:
+            return
+        if edge:
+            display = win.get_display()
+            cursor_name = 'col-resize' if edge[0].direction == 'V' else 'row-resize'
+            cursor = Gdk.Cursor.new_from_name(display, cursor_name)
+            win.set_cursor(cursor)
         else:
-            top_h = h * current.proportion
-            result = self._find_node_region(current.left, target, x, y, w, top_h)
-            if result:
-                return result
-            return self._find_node_region(
-                current.right, target, x, y + top_h, w, h - top_h)
+            win.set_cursor(None)
+

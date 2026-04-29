@@ -227,7 +227,15 @@ class SplitRandRTray:
 
     def _on_open_editor(self, _item):
         if self.app and hasattr(self.app, 'window'):
-            self.app.window.present()
+            # Window was hidden via _on_delete_event — show() + deiconify()
+            # before present() because GTK's present() does NOT reliably
+            # restore a window from the hidden state on every WM (Mutter
+            # included).  show() also reasserts the realised geometry,
+            # so the window comes back at its prior position.
+            win = self.app.window
+            win.show()
+            win.deiconify()
+            win.present_with_time(Gdk.CURRENT_TIME)
         else:
             subprocess.Popen(['splitrandr'])
 

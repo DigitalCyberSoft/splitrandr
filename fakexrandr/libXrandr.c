@@ -35,7 +35,7 @@ int _is_fake_xrandr = 1;
 	Config format version. Bumped when the binary config layout changes.
 	The Python side reads this via ctypes to detect .so / config mismatches.
 */
-int _fakexrandr_config_version = 1;
+int _fakexrandr_config_version = 3;
 
 /*
 	We use this XID modifier to flag outputs and CRTCs as
@@ -105,8 +105,153 @@ struct FakeScreenResources {
 static char *config_file;
 static int config_file_fd;
 static size_t config_file_size;
-/* Config data starts at offset 8 (after "FXRD" + uint32 version header) */
-#define CONFIG_DATA_OFFSET 8
+static unsigned int config_file_version = 0;
+/* v1/v2 layout: FXRD(4) + version(4) + entries...      → entries start at 8
+ * v3 layout:    FXRD(4) + version(4) + primary_name(128) + entries...
+ *               → entries start at 136
+ *
+ * primary_connector_name is a NUL-terminated 128-byte string naming the
+ * connector that should be presented as primary to LD_PRELOAD'd clients
+ * (Cinnamon/Mutter), independent of the X server's XRROutputPrimary state.
+ * Required because Nvidia's binary driver eats `xrandr --primary` on
+ * EDID-tile sub-outputs (e.g. DP-5~3): the driver collapses the parent
+ * output during the call and re-expands it with primary unset, leaving
+ * Mutter to auto-pick the leftmost connector. The .so lies to Mutter so
+ * the user's choice survives the driver's tile shuffle. */
+static char _primary_connector_name[128] = {0};
+
+/* Cache for XRRGetOutputPrimary.  Mutter's display-config apply path
+ * disables the parent CRTC after Cinnamon starts (mechanism still
+ * unidentified — neither monitors.xml nor the X11 primary nudge are
+ * involved; observed even with monitors.xml deleted, 2026-04-29).
+ * Once the CRTC is gone, augment_resources's
+ * config_handle_output check `output_info->crtc == 0` returns 0,
+ * fakes vanish from res->outputs, and XRRGetOutputPrimary's
+ * for-loop can't match the stored primary against any oi->name.
+ *
+ * The fake XID itself is a deterministic function of the parent
+ * RROutput XID (which is stable across CRTC changes — `xrandr
+ * --output X --off` does not free the output) and the leaf index.
+ * Cache the first successful match and return it on subsequent
+ * calls; Mutter then sees a stable primary and survives startup.
+ *
+ * The cache invalidates whenever the bin's primary_connector_name
+ * changes (different name → different leaf → new lookup needed).
+ * The cache persists for the life of the process, which is fine —
+ * if the user re-applies a different layout, splitrandr restarts
+ * Cinnamon (PID change → fresh process → empty cache). */
+static char _primary_cache_for[128] = {0};
+static RROutput _primary_cache_xid = 0;
+#define V3_PRIMARY_NAME_OFFSET 8
+#define V3_PRIMARY_NAME_SIZE 128
+static size_t _config_data_offset(void) {
+	return (config_file_version >= 3)
+		? (V3_PRIMARY_NAME_OFFSET + V3_PRIMARY_NAME_SIZE)
+		: 8;
+}
+
+/*
+	Internal logging for the .so itself. Cinnamon swallows stderr from
+	preloaded libraries, so route diagnostics to /tmp/fakexrandr.log
+	(or $FAKEXRANDR_LOG if set). Logging is enabled when the file is
+	pre-created or when FAKEXRANDR_LOG=1 in the environment — opening
+	the FILE on every call would be wasteful.
+*/
+#include <time.h>
+#include <stdarg.h>
+
+static FILE *_fxr_log = NULL;
+static int _fxr_log_initialized = 0;
+static int _fxr_log_pid = 0;
+
+static void _fxr_log_init(void) {
+	if(_fxr_log_initialized) return;
+	_fxr_log_initialized = 1;
+	/* Logging is OFF unless FAKEXRANDR_LOG is set to a non-empty,
+	 * non-disabling value. XRRGetMonitors fires on every layout query
+	 * so disk-flushed logs would slow Cinnamon's runtime measurably. */
+	const char *path = getenv("FAKEXRANDR_LOG");
+	if(!path || !*path) return;
+	if(strcmp(path, "off") == 0 || strcmp(path, "0") == 0 ||
+	   strcmp(path, "no") == 0) return;
+	/* Bare "1"/"on"/"yes" maps to a default path. Anything else is
+	 * treated as the path itself. */
+	if(strcmp(path, "1") == 0 || strcmp(path, "on") == 0 ||
+	   strcmp(path, "yes") == 0) {
+		path = "/tmp/fakexrandr.log";
+	}
+	_fxr_log = fopen(path, "a");
+	if(_fxr_log) {
+		/* Block-buffered: fflush(NULL) on close handles persistence;
+		 * the user explicitly opts in to log so latency is acceptable. */
+		setvbuf(_fxr_log, NULL, _IOFBF, 8192);
+		_fxr_log_pid = getpid();
+	}
+}
+
+static void _fxr_log_msg(const char *fmt, ...) {
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	struct tm tm;
+	localtime_r(&ts.tv_sec, &tm);
+	fprintf(_fxr_log, "%02d:%02d:%02d.%03ld [%d] ",
+	        tm.tm_hour, tm.tm_min, tm.tm_sec,
+	        ts.tv_nsec / 1000000L, _fxr_log_pid);
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(_fxr_log, fmt, ap);
+	va_end(ap);
+	fputc('\n', _fxr_log);
+	fflush(_fxr_log);
+}
+
+/* Fast no-op when logging is off: skip the var-arg call entirely. */
+#define FXLOG(fmt, ...) do { \
+	if(__builtin_expect(!_fxr_log_initialized, 0)) _fxr_log_init(); \
+	if(_fxr_log) _fxr_log_msg(fmt, ##__VA_ARGS__); \
+} while(0)
+
+/* Per-entry header sizes:
+ *   v1: size(4) name(128) edid(768) width(4) height(4) split_count(4) border(4) tree_data
+ *       → tree starts at offset 4+128+768+4+4+4+4 = 916
+ *   v2: same as v1 plus primary_leaf(4) before tree_data
+ *       → primary_leaf at 916, tree starts at 920
+ */
+#define ENTRY_HEADER_V1 (4 + 128 + 768 + 4 + 4 + 4 + 4)
+#define ENTRY_PRIMARY_LEAF_OFFSET ENTRY_HEADER_V1
+#define ENTRY_HEADER_V2 (ENTRY_HEADER_V1 + 4)
+#define NO_PRIMARY_LEAF 0xFFFFFFFFu
+
+/* True if `name` matches the v3 global primary_connector_name
+ * exactly. Used in XRRGetMonitors passthrough where atom names are
+ * the X server's RandR 1.5 setmonitor names (0-indexed via
+ * splits.py:to_setmonitor_commands), matching primary_connector_name's
+ * canonical 0-indexed encoding. */
+static Bool _global_primary_matches(const char *name) {
+	return _primary_connector_name[0] != '\0' &&
+	       name && strcmp(name, _primary_connector_name) == 0;
+}
+
+/* True if `name` exactly matches the bin's primary_connector_name.
+ * After 2026-04-29 the .so emits fake-output names that are
+ * direct-strcmp-compatible with the bin: leaf 0 takes the parent's
+ * connector name (e.g. "DP-5"), leaves 1..N-1 get "PARENT~1",
+ * "PARENT~2", etc.  fakexrandr_config.py:_compute_primary_connector_name
+ * stores the same form, so a single strcmp resolves primary across
+ * both code paths. */
+static Bool _global_primary_matches_fake_output(const char *name) {
+	if(_primary_connector_name[0] == '\0' || !name) return False;
+	return strcmp(name, _primary_connector_name) == 0;
+}
+
+static unsigned int _entry_primary_leaf(const char *entry) {
+	if(config_file_version < 2) return NO_PRIMARY_LEAF;
+	return *(unsigned int *)(entry + ENTRY_PRIMARY_LEAF_OFFSET);
+}
+
+static unsigned int _entry_tree_offset(void) {
+	return (config_file_version >= 2) ? ENTRY_HEADER_V2 : ENTRY_HEADER_V1;
+}
 
 static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x, unsigned int y, unsigned int width, unsigned int height, unsigned int border, XRRScreenResources *resources, RROutput output, XRROutputInfo *output_info,
 		XRRCrtcInfo *crtc_info, struct FakeInfo ***fake_crtcs, struct FakeInfo ***fake_outputs, struct FakeInfo ***fake_modes) {
@@ -127,7 +272,23 @@ static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x
 		XRROutputInfo *fake_info = (**fake_outputs)->info = (void*)**fake_outputs + sizeof(struct FakeInfo);
 		fake_info->timestamp = output_info->timestamp;
 		fake_info->name = (void*)fake_info + sizeof(XRROutputInfo);
-		fake_info->nameLen = sprintf(fake_info->name, "%s~%d", output_info->name, (*n));
+		/* Leaf 0 takes the parent's connector name (e.g. "DP-5"),
+		 * subsequent leaves get "PARENT~1", "PARENT~2", ...  The
+		 * earlier 1-indexed-everywhere scheme (DP-5~1/~2/~3) hid the
+		 * parent connector entirely, which broke Mutter's
+		 * monitors.xml apply path: the file references parent
+		 * connectors but the MetaMonitor list contained none with
+		 * that name, so Mutter disabled the parent's CRTC, which in
+		 * turn caused config_handle_output's CRTC check to fail on
+		 * the next augment_resources call, fakes vanished, and
+		 * XRRGetOutputPrimary went inconsistent (observed
+		 * 2026-04-29).  Naming leaf 0 with the parent connector
+		 * keeps the monitors.xml lookup sane. */
+		if(*n == 1) {
+			fake_info->nameLen = sprintf(fake_info->name, "%s", output_info->name);
+		} else {
+			fake_info->nameLen = sprintf(fake_info->name, "%s~%d", output_info->name, (*n) - 1);
+		}
 		fake_info->mm_width = output_info->mm_width * width / crtc_info->width;
 		fake_info->mm_height = output_info->mm_height * height / crtc_info->height;
 		fake_info->connection = output_info->connection;
@@ -210,7 +371,7 @@ static char *_config_foreach_split(char *config, unsigned int *n, unsigned int x
 
 static int config_handle_output(Display *dpy, XRRScreenResources *resources, RROutput output, char *target_edid, const char *target_name, struct FakeInfo ***fake_crtcs, struct FakeInfo ***fake_outputs, struct FakeInfo ***fake_modes) {
 	char *config;
-	for(config = config_file + CONFIG_DATA_OFFSET; (int)(config - config_file) <= (int)config_file_size; ) {
+	for(config = config_file + _config_data_offset(); (int)(config - config_file) <= (int)config_file_size; ) {
 		// Walk through the configuration file and search by name or EDID
 		unsigned int size = *(unsigned int *)config;
 		char *name = &config[4];
@@ -241,7 +402,7 @@ static int config_handle_output(Display *dpy, XRRScreenResources *resources, RRO
 
 			if(output_crtc->width == effective_width && output_crtc->height == effective_height) {
 				unsigned int border = *(unsigned int *)&config[4 + 128 + 768 + 4 + 4 + 4];
-				char *tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;
+				char *tree_start = config + _entry_tree_offset();
 
 				// If it is found and the size matches, add fake outputs/crtcs to the list
 				unsigned n = 0;
@@ -308,6 +469,7 @@ static int open_configuration() {
 	/* Require FXRD magic header */
 	if(config_file_size < 8 || memcmp(config_file, "FXRD", 4) != 0) {
 		fprintf(stderr, "fakexrandr: config missing FXRD header, ignoring\n");
+		FXLOG("open_configuration: missing FXRD header (size=%zu)", config_file_size);
 		close_configuration();
 		return 1;
 	}
@@ -315,9 +477,27 @@ static int open_configuration() {
 	if(file_version > (unsigned int)_fakexrandr_config_version) {
 		fprintf(stderr, "fakexrandr: config version %u > supported %d, ignoring\n",
 			file_version, _fakexrandr_config_version);
+		FXLOG("open_configuration: version %u > supported %d, REFUSING",
+		      file_version, _fakexrandr_config_version);
 		close_configuration();
 		return 1;
 	}
+	config_file_version = file_version;
+
+	/* v3+ carries a NUL-terminated primary connector name in a fixed
+	 * 128-byte field directly after the version. Empty string means
+	 * "no global primary override" — clients see the X server's view. */
+	memset(_primary_connector_name, 0, sizeof(_primary_connector_name));
+	if(file_version >= 3 &&
+	   config_file_size >= V3_PRIMARY_NAME_OFFSET + V3_PRIMARY_NAME_SIZE) {
+		memcpy(_primary_connector_name,
+		       config_file + V3_PRIMARY_NAME_OFFSET,
+		       V3_PRIMARY_NAME_SIZE);
+		_primary_connector_name[sizeof(_primary_connector_name) - 1] = '\0';
+	}
+	FXLOG("open_configuration: ok (version=%u, size=%zu, primary=%s)",
+	      file_version, config_file_size,
+	      _primary_connector_name[0] ? _primary_connector_name : "<none>");
 
 	return 0;
 }
@@ -415,6 +595,24 @@ static struct FakeScreenResources *augment_resources(Display *dpy, XRRScreenReso
 		retval->parent_res = res;
 		return retval;
 	}
+
+	/* No setmonitor-VM gate.  splitrandr's apply path no longer
+	 * registers `xrandr --setmonitor` VMs (synthesis-only on this
+	 * Nvidia tiled hardware — see feedback_synthesis_xor_setmonitors).
+	 * Mutter 6.4.1 itself emits XRRSetMonitor calls after we resume
+	 * Cinnamon post-restart, so a setmonitor-presence gate here makes
+	 * augment_resources race Mutter: the FIRST XRRGetScreenResources
+	 * after restart succeeds (no setmonitors yet, fakes synthesized),
+	 * the SECOND fails (Mutter's setmonitors now present, synthesis
+	 * skipped, res->outputs no longer contains the fakes), and
+	 * XRRGetOutputPrimary returns inconsistent XIDs across calls,
+	 * which crashes Mutter's primary detection (observed 2026-04-29).
+	 *
+	 * Always synthesize when the bin has split entries; Mutter's
+	 * setmonitors don't disturb the synthesized output names because
+	 * they live in different namespaces (RandR 1.5 monitor atoms vs
+	 * RandR 1.2 output XIDs).
+	 */
 
 	int i;
 	for(i=0; i<res->noutput; i++) {
@@ -685,6 +883,29 @@ int XRRSetCrtcConfig(Display *dpy, XRRScreenResources *resources, RRCrtc crtc, T
 		}
 	}
 
+	/* Block CRTC disable calls (mode == None) on real CRTCs while
+	 * the .so is active and the bin has split entries.  Mutter
+	 * post-startup tries to disable parent CRTCs based on its
+	 * confused MetaMonitor view of our fake outputs (mode mismatch
+	 * between fake's leaf size and parent's full-screen size); the
+	 * disable causes augment_resources to skip synthesis on the
+	 * next call, fakes vanish from res->outputs, primary detection
+	 * goes inconsistent, and Cinnamon JS dies.
+	 *
+	 * splitrandr's own xrandr invocations strip LD_PRELOAD via
+	 * _xrandr_env() so they don't go through this hook — only
+	 * Mutter / csd-xrandr / other in-session libraries do.
+	 *
+	 * We open_configuration to confirm we're managing splits at
+	 * all; if no bin (open_configuration returns non-zero), the
+	 * .so is dormant and we should pass through unchanged. */
+	if(mode == None && open_configuration() == 0) {
+		FXLOG("XRRSetCrtcConfig: blocked disable of real CRTC 0x%lx "
+		      "(splits active; preventing Mutter from disabling parent)",
+		      (unsigned long)crtc);
+		return RRSetConfigSuccess;
+	}
+
 	return _XRRSetCrtcConfig(dpy, resources, crtc, timestamp, x, y, mode, rotation, outputs, noutputs);
 }
 
@@ -736,18 +957,22 @@ static const char *_collect_leaf_regions(const char *config,
 	Look up a config entry by output name. Returns the number of leaf
 	split regions, or 0 if no config matches. parent_output_xid is the
 	real X output XID for this output (used to build fake XIDs).
+	If out_primary_leaf is non-NULL, also returns the index of the
+	leaf marked primary (or NO_PRIMARY_LEAF if none).
 */
 static int _get_split_regions_for_output(Display *dpy, const char *output_name,
 	RROutput output_xid, struct SplitRegion *regions, int max_count,
-	unsigned int *out_config_w, unsigned int *out_config_h) {
+	unsigned int *out_config_w, unsigned int *out_config_h,
+	unsigned int *out_primary_leaf) {
 
+	if(out_primary_leaf) *out_primary_leaf = NO_PRIMARY_LEAF;
 	if(!config_file) return 0;
 
 	char output_edid[768];
 	get_output_edid(dpy, output_xid, output_edid);
 
 	char *config;
-	for(config = config_file + CONFIG_DATA_OFFSET; (int)(config - config_file) <= (int)config_file_size; ) {
+	for(config = config_file + _config_data_offset(); (int)(config - config_file) <= (int)config_file_size; ) {
 		unsigned int size = *(unsigned int *)config;
 		char *name = &config[4];
 		char *edid = &config[4 + 128];
@@ -758,16 +983,28 @@ static int _get_split_regions_for_output(Display *dpy, const char *output_name,
 		int edid_match = (strncmp(edid, output_edid, 768) == 0);
 
 		if(name_match || edid_match) {
-			char *tree_start = config + 4 + 128 + 768 + 4 + 4 + 4 + 4;
+			char *tree_start = config + _entry_tree_offset();
 
 			/* Use stored config dimensions (0 = use actual) */
 			*out_config_w = width;
 			*out_config_h = height;
+			unsigned int pl = _entry_primary_leaf(config);
+			if(out_primary_leaf) *out_primary_leaf = pl;
 
 			int count = 0;
 			_collect_leaf_regions(tree_start, 0, 0,
 				width ? width : 9999, height ? height : 9999,
 				regions, &count, max_count);
+			FXLOG("get_split_regions(%s): match=%s n=%d cw=%u ch=%u primary_leaf=%s",
+			      output_name ? output_name : "(null)",
+			      name_match ? "name" : "edid",
+			      count, width, height,
+			      pl == NO_PRIMARY_LEAF ? "none" : "set");
+			for(int k = 0; k < count; k++) {
+				FXLOG("  region %d: x=%u y=%u w=%u h=%u%s",
+				      k, regions[k].x, regions[k].y, regions[k].w, regions[k].h,
+				      (pl != NO_PRIMARY_LEAF && (unsigned int)k == pl) ? " PRIMARY" : "");
+			}
 			return count;
 		}
 
@@ -777,17 +1014,229 @@ static int _get_split_regions_for_output(Display *dpy, const char *output_name,
 	return 0;
 }
 
+#define MAX_SPLITS 16
+
+/*
+	Pre-pass for XRRGetMonitors: returns 1 if any input would
+	trigger the splits-emit branch (automatic monitor with a
+	matching fakexrandr config and matching CRTC dimensions),
+	0 otherwise. The setmonitor-VM-skip branch must NOT filter
+	anything when this returns 0 — there are no synthesized
+	duplicates to remove. Skipping this guard caused a Cinnamon
+	SEGV on Nvidia tiled-EDID hardware, where the input monitors
+	look structurally like setmonitor VMs (name has '~', backed
+	by parent output) but are actually native and must pass
+	through unchanged.
+*/
+static int _compute_any_splits_will_emit(Display *dpy, XRRMonitorInfo *orig, int orig_count, XRRScreenResources *res) {
+	struct SplitRegion regions[MAX_SPLITS];
+	int any_splits_will_emit = 0;
+	for(int i = 0; i < orig_count; i++) {
+		if(!orig[i].automatic || orig[i].noutput <= 0) continue;
+		XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, orig[i].outputs[0]);
+		if(!oi || !oi->name) {
+			if(oi) _XRRFreeOutputInfo(oi);
+			continue;
+		}
+		unsigned int cw = 0, ch = 0;
+		int n = _get_split_regions_for_output(dpy, oi->name, orig[i].outputs[0],
+			regions, MAX_SPLITS, &cw, &ch, NULL);
+		if(n > 0) {
+			XRRCrtcInfo *ci = oi->crtc ? _XRRGetCrtcInfo(dpy, res, oi->crtc) : NULL;
+			int dims_match = 0;
+			if(ci) {
+				dims_match = (!cw || ci->width == cw) && (!ch || ci->height == ch);
+				_XRRFreeCrtcInfo(ci);
+			}
+			if(dims_match) {
+				any_splits_will_emit = 1;
+			}
+		}
+		_XRRFreeOutputInfo(oi);
+		if(any_splits_will_emit) break;
+	}
+	return any_splits_will_emit;
+}
+
+/*
+	Predicate for the setmonitor-VM-skip branch shared between
+	Pass 1 and Pass 2. Caller must have already verified the
+	any_splits_will_emit gate plus the (!automatic && name has '~')
+	shape; this helper just performs the base-name lookup against
+	res->outputs to decide whether splits-emit will replace this
+	input. The two passes MUST call this with identical inputs,
+	otherwise total_monitors and the actual emit count desync and
+	Cinnamon's JS layer crashes.
+*/
+static int _input_is_setmonitor_vm_to_skip(Display *dpy, XRRScreenResources *res, const char *atom_name) {
+	struct SplitRegion regions[MAX_SPLITS];
+	/* Strip the ~N suffix to get the base output name */
+	char base_name[128];
+	strncpy(base_name, atom_name, sizeof(base_name) - 1);
+	base_name[sizeof(base_name) - 1] = '\0';
+	char *tilde = strchr(base_name, '~');
+	if(tilde) *tilde = '\0';
+
+	/* Check if this base name has a split config */
+	int has_config = 0;
+	for(int j = 0; j < res->noutput; j++) {
+		XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, res->outputs[j]);
+		if(oi) {
+			if(strcmp(oi->name, base_name) == 0) {
+				unsigned int cw, ch;
+				int n = _get_split_regions_for_output(dpy, base_name,
+					res->outputs[j], regions, MAX_SPLITS, &cw, &ch, NULL);
+				if(n > 0) has_config = 1;
+			}
+			_XRRFreeOutputInfo(oi);
+			if(has_config) break;
+		}
+	}
+	return has_config;
+}
+
+/*
+	Pass 1 dimension-check helper: for an automatic input, returns
+	the number of split regions iff the fakexrandr config dims
+	match the CRTC dims (0 in config = match anything). Returns 0
+	otherwise. Used only to compute total_monitors / total_outputs
+	for the result allocation.
+*/
+static int _pass1_split_count_for_input(Display *dpy, XRRScreenResources *res, const XRRMonitorInfo *m) {
+	struct SplitRegion regions[MAX_SPLITS];
+	if(!m->automatic || m->noutput <= 0) return 0;
+	RROutput mon_output = m->outputs[0];
+	XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, mon_output);
+	int count = 0;
+	if(oi && oi->name) {
+		unsigned int cw, ch;
+		int n = _get_split_regions_for_output(dpy, oi->name, mon_output,
+			regions, MAX_SPLITS, &cw, &ch, NULL);
+		if(n > 0) {
+			/* Verify dimensions match (0 in config = match anything) */
+			XRRCrtcInfo *ci = oi->crtc ? _XRRGetCrtcInfo(dpy, res, oi->crtc) : NULL;
+			int dims_match = 0;
+			if(ci) {
+				dims_match = (!cw || ci->width == cw) && (!ch || ci->height == ch);
+				_XRRFreeCrtcInfo(ci);
+			}
+			if(dims_match) count = n;
+		}
+	}
+	if(oi) _XRRFreeOutputInfo(oi);
+	return count;
+}
+
+/*
+	Pass 2 emit-splits action: if the given automatic input has a
+	matching split config with matching CRTC dims, write n virtual
+	monitors into result[*out_idx_p..] and their fake XIDs into
+	output_pool[*out_output_idx_p..], advance both indices, and
+	return 1. Otherwise return 0 — caller falls through to the
+	passthrough copy path. Must agree with _pass1_split_count_for_input
+	on every input, otherwise the heap-allocated output_pool overflows.
+*/
+static int _pass2_emit_splits_for_input(Display *dpy, XRRScreenResources *res, const XRRMonitorInfo *m,
+		XRRMonitorInfo *result, RROutput *output_pool,
+		int *out_idx_p, int *out_output_idx_p) {
+	struct SplitRegion regions[MAX_SPLITS];
+	if(!m->automatic || m->noutput <= 0) return 0;
+	RROutput mon_output = m->outputs[0];
+	XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, mon_output);
+	int emitted = 0;
+	if(oi && oi->name) {
+		unsigned int cw, ch;
+		unsigned int primary_leaf = NO_PRIMARY_LEAF;
+		int n = _get_split_regions_for_output(dpy, oi->name, mon_output,
+			regions, MAX_SPLITS, &cw, &ch, &primary_leaf);
+		if(n > 0) {
+			XRRCrtcInfo *ci = oi->crtc ? _XRRGetCrtcInfo(dpy, res, oi->crtc) : NULL;
+			int dims_match = 0;
+			if(ci) {
+				dims_match = (!cw || ci->width == cw) && (!ch || ci->height == ch);
+			}
+			if(dims_match) {
+				/* The leaf marked primary in the binary config wins.
+				 * Fall back to leaf 0 if no leaf was explicitly chosen
+				 * but the parent output is primary. */
+				unsigned int eff_primary = primary_leaf;
+				if(eff_primary == NO_PRIMARY_LEAF && m->primary) {
+					eff_primary = 0;
+				}
+				FXLOG("XRRGetMonitors: emit splits for '%s' n=%d orig.primary=%d primary_leaf=%s eff=%s",
+				      oi->name, n, m->primary,
+				      primary_leaf == NO_PRIMARY_LEAF ? "none" : "set",
+				      eff_primary == NO_PRIMARY_LEAF ? "none" : "set");
+				/* Emit virtual monitors for each split region */
+				for(int s = 0; s < n; s++) {
+					int out_idx = *out_idx_p;
+					int out_output_idx = *out_output_idx_p;
+					char vname[128];
+					/* leaf 0 takes parent connector name; leaves
+					 * 1..N-1 are PARENT~1, PARENT~2, ... — matches
+					 * augment_resources' fake-output naming and
+					 * fakexrandr_config.py's primary_connector_name
+					 * encoding. */
+					if(s == 0) {
+						snprintf(vname, sizeof(vname), "%s", oi->name);
+					} else {
+						snprintf(vname, sizeof(vname), "%s~%d", oi->name, s);
+					}
+
+					result[out_idx].name = XInternAtom(dpy, vname, False);
+					result[out_idx].automatic = False;
+					/* Global primary_connector_name (v3+) overrides
+					 * the per-leaf primary_leaf field.  Single
+					 * exact-strcmp form: stored "DP-5" matches the
+					 * leaf-0 fake "DP-5"; stored "DP-5~2" matches
+					 * the third leaf's fake "DP-5~2" (0-indexed
+					 * naming, no +1 offset). */
+					if(_primary_connector_name[0]) {
+						result[out_idx].primary = _global_primary_matches_fake_output(vname) ? True : False;
+					} else {
+						result[out_idx].primary = ((unsigned int)s == eff_primary) ? True : False;
+					}
+					FXLOG("  fake[%d] %s @(%d,%d) %ux%u primary=%d",
+					      s, vname, ci->x + regions[s].x, ci->y + regions[s].y,
+					      regions[s].w, regions[s].h, result[out_idx].primary);
+					result[out_idx].x = ci->x + regions[s].x;
+					result[out_idx].y = ci->y + regions[s].y;
+					result[out_idx].width = regions[s].w;
+					result[out_idx].height = regions[s].h;
+					/* Proportional physical mm dimensions */
+					result[out_idx].mwidth = m->mwidth * regions[s].w / ci->width;
+					result[out_idx].mheight = m->mheight * regions[s].h / ci->height;
+					result[out_idx].noutput = 1;
+					result[out_idx].outputs = &output_pool[out_output_idx];
+					/* Fake XID matching _config_foreach_split convention */
+					output_pool[out_output_idx] = (mon_output & ~XID_SPLIT_MASK) | ((s + 1) << XID_SPLIT_SHIFT);
+					(*out_output_idx_p)++;
+					(*out_idx_p)++;
+				}
+				emitted = 1;
+			}
+			if(ci) _XRRFreeCrtcInfo(ci);
+		}
+	}
+	if(oi) _XRRFreeOutputInfo(oi);
+	return emitted;
+}
+
 XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int *nmonitors) {
 	int orig_count = 0;
 	XRRMonitorInfo *orig = _XRRGetMonitors(dpy, window, get_active, &orig_count);
+	FXLOG("XRRGetMonitors: enter get_active=%d orig_count=%d",
+	      get_active, orig_count);
 
 	if(!orig || orig_count <= 0) {
+		FXLOG("XRRGetMonitors: pass-through (no orig)");
 		if(nmonitors) *nmonitors = orig_count;
 		return orig;
 	}
 
 	if(open_configuration()) {
 		/* No config — pass through */
+		FXLOG("XRRGetMonitors: pass-through (no config)");
 		if(nmonitors) *nmonitors = orig_count;
 		return orig;
 	}
@@ -799,8 +1248,8 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 		return orig;
 	}
 
-	#define MAX_SPLITS 16
-	struct SplitRegion regions[MAX_SPLITS];
+	int any_splits_will_emit = _compute_any_splits_will_emit(dpy, orig, orig_count, res);
+	FXLOG("XRRGetMonitors: any_splits_will_emit=%d", any_splits_will_emit);
 
 	/*
 		Pass 1: count how many monitors we'll have in the result,
@@ -811,38 +1260,28 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 
 	for(int i = 0; i < orig_count; i++) {
 		char *atom_name = XGetAtomName(dpy, orig[i].name);
+		FXLOG("  pass1 orig[%d]: name=%s automatic=%d noutput=%d primary=%d %dx%d+%d+%d",
+		      i, atom_name ? atom_name : "<null>",
+		      orig[i].automatic, orig[i].noutput, orig[i].primary,
+		      orig[i].width, orig[i].height, orig[i].x, orig[i].y);
 		if(!atom_name) {
 			total_monitors++;
 			total_outputs += orig[i].noutput;
 			continue;
 		}
 
-		/* Check if this is a setmonitor VM (non-automatic, name contains ~) */
-		if(!orig[i].automatic && strchr(atom_name, '~')) {
-			/* Strip the ~N suffix to get the base output name */
-			char base_name[128];
-			strncpy(base_name, atom_name, sizeof(base_name) - 1);
-			base_name[sizeof(base_name) - 1] = '\0';
-			char *tilde = strchr(base_name, '~');
-			if(tilde) *tilde = '\0';
-
-			/* Check if this base name has a split config */
-			int has_config = 0;
-			for(int j = 0; j < res->noutput; j++) {
-				XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, res->outputs[j]);
-				if(oi) {
-					if(strcmp(oi->name, base_name) == 0) {
-						unsigned int cw, ch;
-						int n = _get_split_regions_for_output(dpy, base_name,
-							res->outputs[j], regions, MAX_SPLITS, &cw, &ch);
-						if(n > 0) has_config = 1;
-					}
-					_XRRFreeOutputInfo(oi);
-					if(has_config) break;
-				}
-			}
-
-			if(has_config) {
+		/* Check if this is a setmonitor VM (non-automatic, name contains ~).
+		 *
+		 * Only filter when splits-emit will actually run for some other
+		 * input — its purpose is to remove the input that fakexrandr's
+		 * splits-emit branch is about to replace with synthesized fakes.
+		 * If no splits-emit will fire (Nvidia native EDID-tile case,
+		 * where no input has automatic=1 with matching CRTC dims),
+		 * we MUST pass these through, otherwise Cinnamon's JS layout
+		 * manager segfaults in meta_display_logical_index_to_xinerama_index
+		 * because the monitor count drops below what was previously seen. */
+		if(any_splits_will_emit && !orig[i].automatic && strchr(atom_name, '~')) {
+			if(_input_is_setmonitor_vm_to_skip(dpy, res, atom_name)) {
 				/* Skip this setmonitor VM — we'll replace with our splits */
 				XFree(atom_name);
 				continue;
@@ -850,32 +1289,12 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 		}
 
 		/* Check if this is an automatic monitor whose output matches a split config */
-		if(orig[i].automatic && orig[i].noutput > 0) {
-			/* Find the output name for this monitor's first output */
-			RROutput mon_output = orig[i].outputs[0];
-			XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, mon_output);
-			if(oi && oi->name) {
-				unsigned int cw, ch;
-				int n = _get_split_regions_for_output(dpy, oi->name, mon_output,
-					regions, MAX_SPLITS, &cw, &ch);
-				if(n > 0) {
-					/* Verify dimensions match (0 in config = match anything) */
-					XRRCrtcInfo *ci = oi->crtc ? _XRRGetCrtcInfo(dpy, res, oi->crtc) : NULL;
-					int dims_match = 0;
-					if(ci) {
-						dims_match = (!cw || ci->width == cw) && (!ch || ci->height == ch);
-						_XRRFreeCrtcInfo(ci);
-					}
-					if(dims_match) {
-						total_monitors += n;
-						total_outputs += n; /* one output per virtual monitor */
-						_XRRFreeOutputInfo(oi);
-						XFree(atom_name);
-						continue;
-					}
-				}
-			}
-			if(oi) _XRRFreeOutputInfo(oi);
+		int n = _pass1_split_count_for_input(dpy, res, &orig[i]);
+		if(n > 0) {
+			total_monitors += n;
+			total_outputs += n; /* one output per virtual monitor */
+			XFree(atom_name);
+			continue;
 		}
 
 		/* Non-split monitor: keep as-is */
@@ -912,82 +1331,22 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 			continue;
 		}
 
-		/* Check if this is a setmonitor VM to skip */
-		if(!orig[i].automatic && strchr(atom_name, '~')) {
-			char base_name[128];
-			strncpy(base_name, atom_name, sizeof(base_name) - 1);
-			base_name[sizeof(base_name) - 1] = '\0';
-			char *tilde = strchr(base_name, '~');
-			if(tilde) *tilde = '\0';
-
-			int has_config = 0;
-			for(int j = 0; j < res->noutput; j++) {
-				XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, res->outputs[j]);
-				if(oi) {
-					if(strcmp(oi->name, base_name) == 0) {
-						unsigned int cw, ch;
-						int n = _get_split_regions_for_output(dpy, base_name,
-							res->outputs[j], regions, MAX_SPLITS, &cw, &ch);
-						if(n > 0) has_config = 1;
-					}
-					_XRRFreeOutputInfo(oi);
-					if(has_config) break;
-				}
-			}
-
-			if(has_config) {
+		/* Check if this is a setmonitor VM to skip — see Pass 1 comment.
+		 * Same any_splits_will_emit gate; the two passes must agree on
+		 * which inputs they discard, otherwise total_monitors and the
+		 * actual emit count desync and Cinnamon's JS layer crashes. */
+		if(any_splits_will_emit && !orig[i].automatic && strchr(atom_name, '~')) {
+			if(_input_is_setmonitor_vm_to_skip(dpy, res, atom_name)) {
 				XFree(atom_name);
 				continue;
 			}
 		}
 
 		/* Check if this is an automatic monitor to split */
-		if(orig[i].automatic && orig[i].noutput > 0) {
-			RROutput mon_output = orig[i].outputs[0];
-			XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, mon_output);
-			if(oi && oi->name) {
-				unsigned int cw, ch;
-				int n = _get_split_regions_for_output(dpy, oi->name, mon_output,
-					regions, MAX_SPLITS, &cw, &ch);
-				if(n > 0) {
-					XRRCrtcInfo *ci = oi->crtc ? _XRRGetCrtcInfo(dpy, res, oi->crtc) : NULL;
-					int dims_match = 0;
-					if(ci) {
-						dims_match = (!cw || ci->width == cw) && (!ch || ci->height == ch);
-					}
-					if(dims_match) {
-						/* Emit virtual monitors for each split region */
-						for(int s = 0; s < n; s++) {
-							char vname[128];
-							/* 1-indexed to match fakexrandr naming convention */
-							snprintf(vname, sizeof(vname), "%s~%d", oi->name, s + 1);
-
-							result[out_idx].name = XInternAtom(dpy, vname, False);
-							result[out_idx].automatic = False;
-							result[out_idx].primary = (s == 0) ? orig[i].primary : False;
-							result[out_idx].x = ci->x + regions[s].x;
-							result[out_idx].y = ci->y + regions[s].y;
-							result[out_idx].width = regions[s].w;
-							result[out_idx].height = regions[s].h;
-							/* Proportional physical mm dimensions */
-							result[out_idx].mwidth = orig[i].mwidth * regions[s].w / ci->width;
-							result[out_idx].mheight = orig[i].mheight * regions[s].h / ci->height;
-							result[out_idx].noutput = 1;
-							result[out_idx].outputs = &output_pool[out_output_idx];
-							/* Fake XID matching _config_foreach_split convention */
-							output_pool[out_output_idx] = (mon_output & ~XID_SPLIT_MASK) | ((s + 1) << XID_SPLIT_SHIFT);
-							out_output_idx++;
-							out_idx++;
-						}
-						if(ci) _XRRFreeCrtcInfo(ci);
-						_XRRFreeOutputInfo(oi);
-						XFree(atom_name);
-						continue;
-					}
-					if(ci) _XRRFreeCrtcInfo(ci);
-				}
-			}
-			if(oi) _XRRFreeOutputInfo(oi);
+		if(_pass2_emit_splits_for_input(dpy, res, &orig[i], result, output_pool,
+				&out_idx, &out_output_idx)) {
+			XFree(atom_name);
+			continue;
 		}
 
 		/* Non-split monitor: copy as-is */
@@ -995,6 +1354,15 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 		result[out_idx].outputs = &output_pool[out_output_idx];
 		memcpy(result[out_idx].outputs, orig[i].outputs, orig[i].noutput * sizeof(RROutput));
 		out_output_idx += orig[i].noutput;
+		/* Global primary_connector_name (v3+) overrides the X server's
+		 * primary flag. This is the path that handles native EDID-tile
+		 * connectors (e.g. DP-5~3 on Nvidia tiled panels) where no
+		 * fakexrandr split entry exists to attach a primary_leaf to. */
+		if(_primary_connector_name[0]) {
+			result[out_idx].primary = _global_primary_matches(atom_name) ? True : False;
+			FXLOG("XRRGetMonitors: passthrough primary override %s -> %d",
+			      atom_name, result[out_idx].primary);
+		}
 		out_idx++;
 		XFree(atom_name);
 	}
@@ -1002,8 +1370,102 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 	_XRRFreeScreenResources(res);
 	_XRRFreeMonitors(orig);
 
+	FXLOG("XRRGetMonitors: returning %d monitors (total_outputs=%d)",
+	      out_idx, total_outputs);
 	if(nmonitors) *nmonitors = out_idx;
 	return result;
+}
+
+/*
+	XRRGetOutputPrimary override
+
+	Mutter calls this to find the RandR-level primary output. Without an
+	override, the X server returns whatever XRROutputPrimary holds —
+	which on Nvidia tiled-panel hardware is "None" because the driver
+	silently discards `--primary` on tile sub-outputs. Mutter then falls
+	back to picking the leftmost monitor.
+
+	When v3 config carries a primary_connector_name, scan the screen
+	resources for a connector with that name and return its RROutput
+	XID. Fall back to the real call otherwise.
+*/
+RROutput XRRGetOutputPrimary(Display *dpy, Window window) {
+	if(_primary_connector_name[0] == '\0') {
+		return _XRRGetOutputPrimary(dpy, window);
+	}
+
+	/* Cache hit: return the previously-found fake XID without
+	 * re-running augment_resources, which may now be skipping
+	 * synthesis because the parent CRTC was disabled by Mutter
+	 * post-startup. */
+	if(_primary_cache_xid &&
+	   strcmp(_primary_cache_for, _primary_connector_name) == 0) {
+		return _primary_cache_xid;
+	}
+
+	/* Use OUR hooked XRRGetScreenResources, not the underscore variant
+	 * — the augmented resources contain the synthesized fake outputs
+	 * that Mutter's MetaMonitor lookup keys off. */
+	XRRScreenResources *res = XRRGetScreenResources(dpy, window);
+	if(!res) {
+		FXLOG("XRRGetOutputPrimary: no screen resources, falling back");
+		return _XRRGetOutputPrimary(dpy, window);
+	}
+
+	/* Exact strcmp against augmented res->outputs.  The .so emits
+	 * leaf 0 with the parent name, leaves 1..N-1 as PARENT~1/~2/...
+	 * (0-indexed); fakexrandr_config.py's _compute_primary_connector_name
+	 * stores the same form.  Single match form covers both
+	 * primary-on-leaf-0 (raw connector) and primary-on-later-leaf
+	 * (PARENT~N).
+	 */
+	RROutput found = 0;
+	for(int i = 0; i < res->noutput; i++) {
+		XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+		if(!oi) continue;
+		int match = oi->name &&
+		            strcmp(oi->name, _primary_connector_name) == 0;
+		if(match) {
+			found = res->outputs[i];
+			FXLOG("XRRGetOutputPrimary: matched '%s' (stored '%s') -> xid=0x%lx",
+			      oi->name, _primary_connector_name, (unsigned long)found);
+		}
+		XRRFreeOutputInfo(oi);
+		if(found) break;
+	}
+
+	/* No parent-output fallback.  Returning the parent's RROutput XID
+	 * here was empirically a Mutter-killer: Mutter caches the result
+	 * of one XRRGetOutputPrimary call and compares it XID-equal
+	 * against the result of a later call.  When the +1-form fake
+	 * match succeeded once (returning fake xid 0x6001dc) and a later
+	 * call hit this branch returning the parent xid 0x1dc, Mutter
+	 * concluded the primary changed, layoutManager.primaryMonitor
+	 * went undefined, and Cinnamon JS died in main.js
+	 * (observed 2026-04-29).
+	 *
+	 * If no fake matched the stored primary, fall through to the
+	 * real X11 primary below.  When splitrandr's apply has stripped
+	 * `--primary` from the X server (the supported configuration
+	 * for split-primary), _XRRGetOutputPrimary returns 0 (None),
+	 * which Mutter treats as "no primary" and falls back to its
+	 * leftmost-monitor heuristic — wrong tile, but the WM survives.
+	 */
+
+	XRRFreeScreenResources(res);
+	if(found) {
+		/* Cache for subsequent calls when the parent CRTC may be
+		 * disabled and augment_resources won't synthesize this fake
+		 * anymore. */
+		strncpy(_primary_cache_for, _primary_connector_name,
+		        sizeof(_primary_cache_for) - 1);
+		_primary_cache_for[sizeof(_primary_cache_for) - 1] = '\0';
+		_primary_cache_xid = found;
+		return found;
+	}
+	FXLOG("XRRGetOutputPrimary: no match for '%s', falling back",
+	      _primary_connector_name);
+	return _XRRGetOutputPrimary(dpy, window);
 }
 
 /*
@@ -1086,6 +1548,24 @@ xcb_randr_set_crtc_transform(xcb_connection_t *c, xcb_randr_crtc_t crtc,
 	return _real(c, crtc, transform, filter_len, filter_name, filter_params_len, filter_params);
 }
 
+/* Block CRTC disables on REAL CRTCs while splits are active.
+ * Mutter calls xcb_randr_set_crtc_config(crtc, mode=0, outputs_len=0)
+ * during its initial monitor-config apply on this Nvidia tile
+ * hardware; the disable propagates to the X server, the .so's
+ * subsequent augment_resources sees output_info->crtc == 0,
+ * synthesis fails, fakes vanish from res->outputs,
+ * XRRGetOutputPrimary goes inconsistent, and Cinnamon JS dies in
+ * main.js with `layoutManager.primaryMonitor is undefined`.  This
+ * block path is what the Xlib XRRSetCrtcConfig hook was never
+ * catching — Muffin uses xcb-randr for the disable, not Xlib. */
+static int _is_real_crtc_disable(xcb_randr_crtc_t crtc, xcb_randr_mode_t mode,
+                                  uint32_t outputs_len) {
+	if(crtc & XID_SPLIT_MASK) return 0;       /* fake CRTC */
+	if(mode != 0 || outputs_len != 0) return 0; /* not a disable */
+	if(open_configuration() != 0) return 0;   /* no splits configured */
+	return 1;
+}
+
 xcb_randr_set_crtc_config_cookie_t
 xcb_randr_set_crtc_config_checked(xcb_connection_t *c, xcb_randr_crtc_t crtc,
 	xcb_timestamp_t timestamp, xcb_timestamp_t config_timestamp,
@@ -1100,6 +1580,11 @@ xcb_randr_set_crtc_config_checked(xcb_connection_t *c, xcb_randr_crtc_t crtc,
 	uint32_t i;
 	for(i = 0; i < outputs_len; i++) {
 		if(outputs[i] & XID_SPLIT_MASK) return _fake_crtc_cookie;
+	}
+	if(_is_real_crtc_disable(crtc, mode, outputs_len)) {
+		FXLOG("xcb_randr_set_crtc_config_checked: BLOCKED disable of crtc 0x%x",
+		      (unsigned int)crtc);
+		return _fake_crtc_cookie;
 	}
 	return _real(c, crtc, timestamp, config_timestamp, x, y, mode, rotation, outputs_len, outputs);
 }
@@ -1119,6 +1604,13 @@ xcb_randr_set_crtc_config(xcb_connection_t *c, xcb_randr_crtc_t crtc,
 	for(i = 0; i < outputs_len; i++) {
 		if(outputs[i] & XID_SPLIT_MASK) return _fake_crtc_cookie;
 	}
+	if(_is_real_crtc_disable(crtc, mode, outputs_len)) {
+		FXLOG("xcb_randr_set_crtc_config: BLOCKED disable of crtc 0x%x",
+		      (unsigned int)crtc);
+		return _fake_crtc_cookie;
+	}
+	FXLOG("xcb_randr_set_crtc_config: crtc=0x%x mode=0x%x outputs_len=%u (passing through)",
+	      (unsigned int)crtc, (unsigned int)mode, outputs_len);
 	return _real(c, crtc, timestamp, config_timestamp, x, y, mode, rotation, outputs_len, outputs);
 }
 

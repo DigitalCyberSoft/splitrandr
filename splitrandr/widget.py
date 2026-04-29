@@ -172,12 +172,16 @@ class MonitorWidget(Gtk.DrawingArea):
                 self._show_monitor_indicator(name)
 
     def __init__(self, window, factor=8, display=None, force_version=False,
-                 readonly=False):
+                 readonly=False, show_splits=True, share_xrandr_with=None):
         super(MonitorWidget, self).__init__()
 
         self.window = window
         self._factor = factor
         self._readonly = readonly
+        # When False, render the underlying physical layout — ignore
+        # cfg.splits and cfg.borders. Used by the "Real (no virtual)"
+        # pane to show what xrandr would see without setmonitor/fakexrandr.
+        self._show_splits = show_splits
         self._theme_colors = _get_theme_colors()
         self._screenshots = {}
         self._monitors = []
@@ -187,16 +191,27 @@ class MonitorWidget(Gtk.DrawingArea):
             1024 // self.factor, 1024 // self.factor
         )
 
+        self._split_drag = None  # (output_name, split_node) while resizing in main view
+
         if not readonly:
             self.connect('button-press-event', self.click)
             self.set_events(
                 Gdk.EventMask.BUTTON_PRESS_MASK |
+                Gdk.EventMask.BUTTON_RELEASE_MASK |
                 Gdk.EventMask.POINTER_MOTION_MASK
             )
             self.connect('motion-notify-event', self._on_motion)
+            self.connect('button-release-event', self._on_release)
             self.setup_draganddrop()
 
-        self._xrandr = XRandR(display=display, force_version=force_version)
+        if share_xrandr_with is not None:
+            # Share the editable widget's XRandR. Avoids duplicate
+            # xrandr --verbose / --listmonitors queries on every load
+            # and keeps the Real pane in lockstep with the Proposed
+            # pane's current_cfg state.
+            self._xrandr = share_xrandr_with._xrandr
+        else:
+            self._xrandr = XRandR(display=display, force_version=force_version)
 
         self.connect('draw', self.do_expose_event)
 
@@ -250,8 +265,8 @@ class MonitorWidget(Gtk.DrawingArea):
                 'w': out.size[0], 'h': out.size[1],
                 'primary': out.primary,
                 'rotation': out.rotation,
-                'splits': cfg.splits.get(name),
-                'border': cfg.borders.get(name, 0),
+                'splits': cfg.splits.get(name) if self._show_splits else None,
+                'border': cfg.borders.get(name, 0) if self._show_splits else 0,
             })
 
     def _update_size_request(self):
@@ -295,11 +310,19 @@ class MonitorWidget(Gtk.DrawingArea):
         self._hide_monitor_indicator()
         if output_name is None:
             return
-        cfg = self._xrandr.configuration.outputs.get(output_name)
+        phys, leaf_idx = self.parse_virtual_name(output_name)
+        cfg = self._xrandr.configuration.outputs.get(phys)
         if not cfg or not cfg.active:
             return
         x, y = cfg.position
         w, h = cfg.size
+        if leaf_idx is not None:
+            tree = self._xrandr.configuration.splits.get(phys)
+            if tree:
+                regions = list(tree.leaf_regions(w, h))
+                if 0 <= leaf_idx < len(regions):
+                    rx, ry, rw, rh, _, _ = regions[leaf_idx]
+                    x, y, w, h = x + rx, y + ry, rw, rh
         try:
             self._indicator = _MonitorIdentifier(output_name, x, y, w, h)
             self._indicator_timer = GLib.timeout_add(2000, self._hide_monitor_indicator)
@@ -325,9 +348,21 @@ class MonitorWidget(Gtk.DrawingArea):
         self._is_cinnamon = False
         self._sync_monitors()
 
-        # Validate selection
+        # Validate selection: accept either a physical name or a virtual
+        # name whose parent is still active and split.
         active_names = [m['name'] for m in self._monitors]
-        if self._selected_output not in active_names:
+        sel = self._selected_output
+        valid = False
+        if sel:
+            phys, leaf_idx = self.parse_virtual_name(sel)
+            if leaf_idx is None and sel in active_names:
+                valid = True
+            elif leaf_idx is not None and phys in active_names:
+                tree = self._xrandr.configuration.splits.get(phys)
+                if tree and not tree.is_leaf:
+                    leaf_count = sum(1 for _ in tree.iter_leaves())
+                    valid = 0 <= leaf_idx < leaf_count
+        if not valid:
             if len(active_names) == 1:
                 self._selected_output = active_names[0]
             else:
@@ -379,6 +414,14 @@ class MonitorWidget(Gtk.DrawingArea):
 
     def save_to_x(self):
         self._xrandr.save_to_x()
+        # load_from_x() now layers splits from cinnamon + layout.json
+        # internally, so the trailing reload picks up the just-applied
+        # state without any explicit re-merge here. Cinnamon's
+        # MetaMonitor list — refreshed by _xrandr.save_to_x's restart —
+        # is the authoritative source; layout.json (still holding the
+        # OLD splits at this point because gui_app_apply writes it
+        # AFTER this method returns) only fills outputs Cinnamon
+        # doesn't currently surface.
         self.load_from_x()
 
     #################### doing changes ####################
@@ -405,17 +448,39 @@ class MonitorWidget(Gtk.DrawingArea):
     def set_resolution(self, output_name, res):
         self._set_something('mode', output_name, res)
 
-    def set_primary(self, output_name, primary):
+    @staticmethod
+    def parse_virtual_name(name):
+        """Split a name like 'DP-5~2' into ('DP-5', 1) (zero-indexed leaf).
+        Returns (name, None) if not a virtual."""
+        if name and '~' in name:
+            base, idx = name.rsplit('~', 1)
+            try:
+                return (base, int(idx) - 1)
+            except ValueError:
+                pass
+        return (name, None)
+
+    def set_primary(self, output_name, primary, leaf_idx=None):
+        """Toggle primary on a physical output, optionally targeting a leaf.
+        Setting any primary clears primary from every other output and leaf."""
         output = self._xrandr.configuration.outputs[output_name]
 
-        if primary and not output.primary:
-            for output_2 in self._xrandr.outputs:
-                self._xrandr.configuration.outputs[output_2].primary = False
+        if primary:
+            for other in self._xrandr.outputs:
+                self._xrandr.configuration.outputs[other].primary = False
+                other_tree = self._xrandr.configuration.splits.get(other)
+                if other_tree is not None:
+                    other_tree.clear_primary()
             output.primary = True
-        elif not primary and output.primary:
-            output.primary = False
+            if leaf_idx is not None:
+                tree = self._xrandr.configuration.splits.get(output_name)
+                if tree is not None:
+                    tree.set_primary_at(leaf_idx)
         else:
-            return
+            output.primary = False
+            tree = self._xrandr.configuration.splits.get(output_name)
+            if tree is not None:
+                tree.clear_primary()
 
         self._sync_monitors()
         self._force_repaint()
@@ -451,7 +516,60 @@ class MonitorWidget(Gtk.DrawingArea):
 
     #################### hover tracking ####################
 
+    SPLIT_GRAB_PX = 8  # widget-pixel grab radius for split lines in the main view
+
+    def _virtual_at(self, x, y):
+        """Return the virtual display name (e.g. 'DP-5~2') at widget coords,
+        or None if the click isn't inside a split sub-region."""
+        real_x = x * self.factor
+        real_y = y * self.factor
+        for mon in reversed(self._monitors):
+            tree = mon.get('splits')
+            if not tree or tree.is_leaf:
+                continue
+            cx = real_x - mon['x']
+            cy = real_y - mon['y']
+            if not (0 <= cx <= mon['w'] and 0 <= cy <= mon['h']):
+                continue
+            for i, (rx, ry, rw, rh, _, _) in enumerate(
+                    tree.leaf_regions(mon['w'], mon['h'])):
+                if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+                    return "%s~%d" % (mon['name'], i + 1)
+        return None
+
+    def _find_split_line(self, x, y):
+        """Find a split line at widget coords (x, y).
+        Returns (output_name, split_node) or None.
+        Iterates topmost monitor first (last in _monitors list)."""
+        real_x = x * self.factor
+        real_y = y * self.factor
+        threshold_real_px = self.SPLIT_GRAB_PX * self.factor
+
+        for mon in reversed(self._monitors):
+            tree = mon.get('splits')
+            if not tree:
+                continue
+            mw, mh = mon['w'], mon['h']
+            cx = real_x - mon['x']
+            cy = real_y - mon['y']
+            if not (0 <= cx <= mw and 0 <= cy <= mh):
+                continue
+            pcx = cx / mw if mw else 0
+            pcy = cy / mh if mh else 0
+            edge = tree.find_nearest_edge(
+                pcx, pcy,
+                threshold_px=threshold_real_px,
+                canvas_w=mw, canvas_h=mh,
+            )
+            if edge:
+                return (mon['name'], edge[0])
+        return None
+
     def _on_motion(self, widget, event):
+        if self._split_drag:
+            self._update_split_drag(event.x, event.y)
+            return
+
         old_hover = self._hover_output
         undermouse = self._get_point_outputs(event.x, event.y)
         if undermouse:
@@ -462,6 +580,58 @@ class MonitorWidget(Gtk.DrawingArea):
             self._hover_output = None
         if old_hover != self._hover_output:
             self._force_repaint()
+
+        # Cursor feedback when hovering over a draggable split line.
+        win = self.get_window()
+        if win:
+            line = self._find_split_line(event.x, event.y)
+            if line:
+                cursor_name = ('col-resize' if line[1].direction == 'V'
+                               else 'row-resize')
+                win.set_cursor(Gdk.Cursor.new_from_name(
+                    win.get_display(), cursor_name))
+            else:
+                win.set_cursor(None)
+
+    SPLIT_SNAP_PERCENT = 5  # snap proportion to nearest N% during main-window drag
+
+    @classmethod
+    def _snap_proportion(cls, prop):
+        step = cls.SPLIT_SNAP_PERCENT / 100.0
+        snapped = round(prop / step) * step
+        return max(0.05, min(0.95, snapped))
+
+    def _update_split_drag(self, x, y):
+        output_name, node = self._split_drag
+        mon = next((m for m in self._monitors if m['name'] == output_name), None)
+        if not mon:
+            return
+        tree = self._xrandr.configuration.splits.get(output_name)
+        if not tree:
+            return
+        region = tree.find_node_region(node)
+        if not region:
+            return
+        rx, ry, rw, rh = region
+        real_x = x * self.factor - mon['x']
+        real_y = y * self.factor - mon['y']
+        if mon['w'] <= 0 or mon['h'] <= 0:
+            return
+        if node.direction == 'V':
+            new_prop = (real_x / mon['w'] - rx) / rw if rw > 0 else 0.5
+        else:
+            new_prop = (real_y / mon['h'] - ry) / rh if rh > 0 else 0.5
+        node.proportion = self._snap_proportion(new_prop)
+        self._force_repaint()
+
+    def _on_release(self, _widget, event):
+        if event.button == 1 and self._split_drag is not None:
+            self._split_drag = None
+            # Re-enable monitor drag-and-drop after our split-resize gesture.
+            self._enable_monitor_drag_source()
+            self._sync_monitors()
+            self._force_repaint()
+            self.emit('changed')
 
     #################### painting ####################
 
@@ -536,10 +706,18 @@ class MonitorWidget(Gtk.DrawingArea):
             splits = mon['splits']
             border = mon['border']
             if splits:
+                # Determine selected leaf for this monitor (if any)
+                selected_leaf_idx = None
+                sel = self._selected_output
+                if sel:
+                    sel_phys, sel_leaf = self.parse_virtual_name(sel)
+                    if sel_phys == name and sel_leaf is not None:
+                        selected_leaf_idx = sel_leaf
                 self._draw_split_overlay(
                     context, splits,
                     rect[0], rect[1], rect[2], rect[3],
-                    border
+                    border,
+                    selected_leaf_idx=selected_leaf_idx,
                 )
             elif border > 0:
                 # Unsplit output with border — show inset region
@@ -608,9 +786,11 @@ class MonitorWidget(Gtk.DrawingArea):
 
             context.restore()
 
-    def _draw_split_overlay(self, context, tree, x, y, w, h, border=0):
+    def _draw_split_overlay(self, context, tree, x, y, w, h, border=0,
+                            selected_leaf_idx=None):
         """Draw semi-transparent colored regions for each split sub-monitor."""
         regions = list(tree.leaf_regions_proportional())
+        leaves = [leaf for _, leaf in tree.iter_leaves()]
         # Compute border as proportion of monitor dimensions
         bx_frac = border / w if w > 0 else 0
         by_frac = border / h if h > 0 else 0
@@ -634,13 +814,32 @@ class MonitorWidget(Gtk.DrawingArea):
             context.rectangle(px, py, pw, ph)
             context.fill()
 
-            # Dashed border
-            context.set_source_rgba(*color, 0.7)
-            context.set_line_width(2)
-            context.set_dash([6, 4])
-            context.rectangle(px, py, pw, ph)
-            context.stroke()
-            context.set_dash([])
+            is_selected = (i == selected_leaf_idx)
+            is_primary = (i < len(leaves) and leaves[i].primary)
+
+            # Border: thick blue if selected, normal dashed colored otherwise
+            if is_selected:
+                context.set_source_rgba(0.2, 0.5, 0.9, 0.95)
+                context.set_line_width(4)
+                context.rectangle(px, py, pw, ph)
+                context.stroke()
+            else:
+                context.set_source_rgba(*color, 0.7)
+                context.set_line_width(2)
+                context.set_dash([6, 4])
+                context.rectangle(px, py, pw, ph)
+                context.stroke()
+                context.set_dash([])
+
+            # Primary marker: solid yellow corner badge
+            if is_primary and pw > 12 and ph > 12:
+                context.set_source_rgba(1.0, 0.85, 0.0, 0.9)
+                context.rectangle(px + 4, py + 4, 10, 10)
+                context.fill()
+                context.set_source_rgba(0, 0, 0, 0.7)
+                context.set_line_width(1)
+                context.rectangle(px + 4, py + 4, 10, 10)
+                context.stroke()
 
     def _force_repaint(self):
         self.queue_draw()
@@ -649,6 +848,15 @@ class MonitorWidget(Gtk.DrawingArea):
 
     def click(self, _widget, event):
         undermouse = self._get_point_outputs(event.x, event.y)
+        if event.button == 1:
+            # If the click landed on a split line, start a resize drag.
+            # Returning True consumes the press so GTK's default handler
+            # (which kicks off monitor D&D) never runs for this gesture.
+            line = self._find_split_line(event.x, event.y)
+            if line:
+                self._split_drag = line
+                self._lastclick = (event.x, event.y)
+                return True
         if event.button == 1 and undermouse:
             which = self._get_point_active_output(event.x, event.y)
             # Bring clicked monitor to top of draw order
@@ -657,7 +865,10 @@ class MonitorWidget(Gtk.DrawingArea):
                     self._monitors.append(self._monitors.pop(i))
                     break
 
-            self.selected_output = which
+            # If the click is inside a split sub-region, select that virtual
+            # display so the user can mark it primary individually.
+            virtual = self._virtual_at(event.x, event.y)
+            self.selected_output = virtual if virtual else which
             self._force_repaint()
         elif event.button == 1 and not undermouse:
             self.selected_output = None
@@ -665,6 +876,12 @@ class MonitorWidget(Gtk.DrawingArea):
             if undermouse:
                 target = [m['name'] for m in self._monitors
                           if m['name'] in undermouse][-1]
+                # If the right-click landed inside a virtual sub-region,
+                # target that specific leaf so the menu's Primary toggle
+                # operates per-leaf instead of on the parent monitor.
+                virtual = self._virtual_at(event.x, event.y)
+                if virtual and self.parse_virtual_name(virtual)[0] == target:
+                    target = virtual
                 menu = self._contextmenu(target)
                 menu.popup(None, None, None, None, event.button, event.time)
             else:
@@ -705,23 +922,44 @@ class MonitorWidget(Gtk.DrawingArea):
         return menu
 
     def _contextmenu(self, output_name):
+        # output_name may be a virtual like "DP-5~2"; resolve to the
+        # physical parent for most operations but track leaf_idx so the
+        # Primary checkbox can target the specific leaf.
+        phys_name, leaf_idx = self.parse_virtual_name(output_name)
         menu = Gtk.Menu()
-        output_config = self._xrandr.configuration.outputs[output_name]
-        output_state = self._xrandr.state.outputs[output_name]
+        output_config = self._xrandr.configuration.outputs[phys_name]
+        output_state = self._xrandr.state.outputs[phys_name]
+
+        if leaf_idx is not None:
+            header = Gtk.MenuItem(label=output_name)
+            header.set_sensitive(False)
+            menu.add(header)
+            menu.add(Gtk.SeparatorMenuItem())
 
         enabled = Gtk.CheckMenuItem(_("Active"))
         enabled.props.active = output_config.active
         enabled.connect('activate', lambda menuitem: self.set_active(
-            output_name, menuitem.props.active))
+            phys_name, menuitem.props.active))
 
         menu.add(enabled)
 
         if output_config.active:
             if Feature.PRIMARY in self._xrandr.features:
                 primary = Gtk.CheckMenuItem(_("Primary"))
-                primary.props.active = output_config.primary
-                primary.connect('activate', lambda menuitem: self.set_primary(
-                    output_name, menuitem.props.active))
+                if leaf_idx is None:
+                    primary.props.active = output_config.primary
+                    primary.connect('activate', lambda menuitem: self.set_primary(
+                        phys_name, menuitem.props.active))
+                else:
+                    tree = self._xrandr.configuration.splits.get(phys_name)
+                    leaf_primary = (output_config.primary and tree is not None
+                                    and tree.primary_leaf_index() == leaf_idx)
+                    primary.props.active = leaf_primary
+                    def _toggle_leaf_primary(menuitem, _phys=phys_name, _leaf=leaf_idx):
+                        active = menuitem.props.active
+                        self.set_primary(_phys, active,
+                                         leaf_idx=_leaf if active else None)
+                    primary.connect('activate', _toggle_leaf_primary)
                 menu.add(primary)
 
             res_m = Gtk.Menu()
@@ -737,7 +975,7 @@ class MonitorWidget(Gtk.DrawingArea):
                         self.error_message(
                             _("Setting this resolution is not possible here: %s") % exc
                         )
-                i.connect('activate', _res_set, output_name, mode)
+                i.connect('activate', _res_set, phys_name, mode)
                 res_m.add(i)
 
             or_m = Gtk.Menu()
@@ -753,7 +991,7 @@ class MonitorWidget(Gtk.DrawingArea):
                         self.error_message(
                             _("This orientation is not possible here: %s") % exc
                         )
-                i.connect('activate', _rot_set, output_name, rotation)
+                i.connect('activate', _rot_set, phys_name, rotation)
                 if rotation not in output_state.rotations:
                     i.props.sensitive = False
                 or_m.add(i)
@@ -770,12 +1008,12 @@ class MonitorWidget(Gtk.DrawingArea):
             menu.add(Gtk.SeparatorMenuItem())
 
             split_item = Gtk.MenuItem(_("Split Monitor..."))
-            split_item.connect('activate', self._on_split_monitor, output_name)
+            split_item.connect('activate', self._on_split_monitor, phys_name)
             menu.add(split_item)
 
-            if output_name in self._xrandr.configuration.splits:
+            if phys_name in self._xrandr.configuration.splits:
                 remove_split = Gtk.MenuItem(_("Remove Splits"))
-                remove_split.connect('activate', self._on_remove_splits, output_name)
+                remove_split.connect('activate', self._on_remove_splits, phys_name)
                 menu.add(remove_split)
 
         menu.show_all()
@@ -815,13 +1053,16 @@ class MonitorWidget(Gtk.DrawingArea):
 
     #################### drag&drop ####################
 
-    def setup_draganddrop(self):
+    def _enable_monitor_drag_source(self):
         self.drag_source_set(
             Gdk.ModifierType.BUTTON1_MASK,
             [Gtk.TargetEntry.new('splitrandr-output',
                                  Gtk.TargetFlags.SAME_WIDGET, 0)],
             0
         )
+
+    def setup_draganddrop(self):
+        self._enable_monitor_drag_source()
         self.drag_dest_set(
             0,
             [Gtk.TargetEntry.new('splitrandr-output',
