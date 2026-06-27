@@ -73,6 +73,18 @@ def _regenerate_config():
     xrandr = XRandR(force_version=True)
     xrandr.load_from_x()
 
+    # Refuse to capture an overlapping/stale layout into the profile +
+    # layout.json. Running --regenerate while the X state is bad (e.g. a
+    # resume that stacked both outputs at +0+0) would otherwise persist the
+    # corruption that the watcher then re-applies. See
+    # feedback_profile_overlap_brake.
+    from .gui_app_apply import _safe_to_save_profile
+    if not _safe_to_save_profile(xrandr):
+        print("Refusing to regenerate: current layout failed the safety "
+              "check (overlapping outputs or stale splits). Fix the layout "
+              "first.")
+        return
+
     # Preserve pre-commands from existing JSON config if present
     json_path = _layout_json_path()
     if os.path.exists(json_path):

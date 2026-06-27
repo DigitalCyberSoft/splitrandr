@@ -35,19 +35,49 @@ from .i18n import _
 
 
 def _safe_to_save_profile(xrandr):
-    """Return False if cfg.splits is empty but Cinnamon's live MetaMonitor
-    list shows more monitors than active outputs — i.e. the user has
-    splits on screen right now and the in-memory configuration is stale
-    (typically because a load_from_json just replaced cfg.splits with
-    {} from a corrupted profile). Saving in that state would propagate
-    the corruption.
+    """Return False when the in-memory configuration must not be persisted
+    because it would propagate a transient or corrupt state to disk.
 
-    Returns True if it's safe to save (cfg.splits has data, OR cinnamon
-    isn't reachable, OR cinnamon agrees there are no splits). The
-    permissive default avoids blocking legitimate "user explicitly
-    wants no splits" applies — any caller that genuinely wants empty
-    splits should still proceed."""
+    Two independent brakes:
+
+    1. Position overlap. Two active outputs sharing one position is the
+       signature of a resume/hotplug state captured by mistake (the Nvidia
+       driver brings both panels up at +0+0 on wake). A split-monitor
+       layout never legitimately stacks two outputs at one origin, and
+       persisting it makes the watcher re-apply the overlap on every wake.
+       See feedback_profile_overlap_brake.
+
+    2. Stale empty splits. cfg.splits is empty but Cinnamon's live
+       MetaMonitor list shows more monitors than active outputs — the user
+       has splits on screen but the in-memory config is stale (typically a
+       load_from_json just replaced cfg.splits with {} from a corrupted
+       profile). See feedback_profile_corruption_empty_splits.
+
+    Returns True when neither brake trips. The empty-splits brake keeps a
+    permissive default (cinnamon unreachable, or agrees there are no
+    splits) so legitimate "user explicitly wants no splits" applies still
+    proceed."""
     cfg = xrandr.configuration
+
+    # Brake 1: position overlap. Runs regardless of splits — the corruption
+    # we guard against has an intact splits dict but overlapping outputs.
+    seen = {}
+    for name, out in cfg.outputs.items():
+        if not getattr(out, 'active', False):
+            continue
+        pos = getattr(out, 'position', None)
+        if pos is None:
+            continue
+        pos = tuple(pos)
+        if pos in seen:
+            log.warning(
+                "refusing to save profile: active outputs %s and %s share "
+                "position %s (overlap; likely a transient resume state)",
+                seen[pos], name, pos)
+            return False
+        seen[pos] = name
+
+    # Brake 2: stale empty splits.
     if cfg.splits:
         return True  # have data → safe
     # No splits in cfg. Check if cinnamon disagrees.
@@ -285,9 +315,9 @@ class ApplicationApplyMixin:
                     log.warning("failed to pre-update active profile: %s", e)
             else:
                 log.warning(
-                    "skipping pre-save of profile %r: cfg.splits is empty "
-                    "but Cinnamon still shows splits — refusing to "
-                    "propagate stale state to disk",
+                    "skipping pre-save of profile %r: layout failed the "
+                    "safety check (see warning above) — refusing to "
+                    "propagate unsafe state to disk",
                     active,
                 )
 
@@ -317,8 +347,13 @@ class ApplicationApplyMixin:
             log.warning("window-layout restore failed: %s", e)
 
         # save_to_x can rebuild the configuration via load_from_x; refresh
-        # the profile JSON with the post-load state for accuracy.
-        if active:
+        # the profile JSON with the post-load state for accuracy. Gate on
+        # the safety check: if save_to_x left X overlapping (e.g. a
+        # partially-applied resume), the post-load config would carry that
+        # overlap onto disk and the watcher would re-apply it on every
+        # wake. See feedback_profile_overlap_brake.
+        post_safe = _safe_to_save_profile(self.widget._xrandr)
+        if active and post_safe:
             try:
                 profiles.save_profile(
                     active,
@@ -326,13 +361,21 @@ class ApplicationApplyMixin:
                 )
             except Exception as e:
                 log.warning("failed to refresh active profile after apply: %s", e)
+        elif active and not post_safe:
+            log.warning(
+                "keeping prior profile %r on disk: post-apply layout failed "
+                "the safety check", active)
 
         # Keep layout.json (the autostart/--apply entry point) in sync with
-        # the active profile on every Apply, not just Apply & Autostart.
-        try:
-            self.widget._xrandr.save_to_json(self.LAYOUT_JSON)
-        except Exception as e:
-            log.warning("failed to update layout.json after apply: %s", e)
+        # the active profile on every Apply, not just Apply & Autostart —
+        # but never overwrite a good layout.json with an unsafe one.
+        if post_safe:
+            try:
+                self.widget._xrandr.save_to_json(self.LAYOUT_JSON)
+            except Exception as e:
+                log.warning("failed to update layout.json after apply: %s", e)
+        else:
+            log.warning("not updating layout.json: post-apply layout unsafe")
 
         if not self._confirm_or_revert(revert_script):
             # User reverted — restore the prior profile contents.
@@ -372,9 +415,9 @@ class ApplicationApplyMixin:
                     log.warning("failed to pre-update active profile: %s", e)
             else:
                 log.warning(
-                    "skipping pre-save of profile %r: cfg.splits is empty "
-                    "but Cinnamon still shows splits — refusing to "
-                    "propagate stale state to disk",
+                    "skipping pre-save of profile %r: layout failed the "
+                    "safety check (see warning above) — refusing to "
+                    "propagate unsafe state to disk",
                     active,
                 )
 
@@ -396,7 +439,10 @@ class ApplicationApplyMixin:
             return
 
         # Refresh profile after save_to_x's reload may have rebuilt cfg.
-        if active:
+        # Gate on the safety check so a partially-applied/overlapping resume
+        # state can't be written to disk. See feedback_profile_overlap_brake.
+        post_safe = _safe_to_save_profile(self.widget._xrandr)
+        if active and post_safe:
             try:
                 profiles.save_profile(
                     active,
@@ -404,6 +450,10 @@ class ApplicationApplyMixin:
                 )
             except Exception as e:
                 log.warning("failed to refresh active profile after apply: %s", e)
+        elif active and not post_safe:
+            log.warning(
+                "keeping prior profile %r on disk: post-apply layout failed "
+                "the safety check", active)
 
         if not self._confirm_or_revert(revert_script):
             if active and old_profile is not None:
@@ -414,8 +464,13 @@ class ApplicationApplyMixin:
                     log.warning("failed to restore profile after revert: %s", e)
             return
 
-        # Save layout as JSON (autostart entry point reads this)
-        self.widget._xrandr.save_to_json(self.LAYOUT_JSON)
+        # Save layout as JSON (autostart entry point reads this) — unless the
+        # layout failed the safety check, in which case keep the prior good
+        # layout.json.
+        if post_safe:
+            self.widget._xrandr.save_to_json(self.LAYOUT_JSON)
+        else:
+            log.warning("not updating layout.json: post-apply layout unsafe")
 
         # Restore window positions in case the apply restarted Cinnamon.
         try:

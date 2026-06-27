@@ -306,7 +306,12 @@ class ScreenWatcher:
             except (KeyError, ValueError, AttributeError):
                 continue
             for i, (lx, ly, lw, lh) in enumerate(_leaf_regions(tree_data, pw, ph)):
-                fake_name = "%s~%d" % (output_name, i + 1)
+                # The watcher runs with LD_PRELOAD, so this xrandr --query
+                # is hooked: the .so folds split leaf 0 into the bare parent
+                # name and numbers the rest from ~1 (leaf 1 -> NAME~1). Match
+                # that naming — leaf 0 is NAME, leaf i>=1 is NAME~i.
+                # See feedback_layout_matches_offbyone.
+                fake_name = output_name if i == 0 else "%s~%d" % (output_name, i)
                 expected = (lw, lh, px + lx, py + ly)
                 actual = current.get(fake_name)
                 if actual != expected:
