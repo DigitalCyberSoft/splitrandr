@@ -1,5 +1,5 @@
 Name:           splitrandr
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Monitor Layout Editor with Virtual Monitor Splitting
 
@@ -21,6 +21,10 @@ Requires:       python3-gobject
 Requires:       gtk3
 Requires:       xrandr
 Requires:       libXrandr
+# cinnamon_compat.py shells out to the gdbus CLI (org.Cinnamon.Eval,
+# D-Bus readiness). Nothing Provides a bare "gdbus"; glib2 ships the
+# file, so depend on the path, which resolves to glib2.
+Requires:       /usr/bin/gdbus
 
 Recommends:     xapp
 Recommends:     libappindicator-gtk3
@@ -76,5 +80,13 @@ ln -s libXrandr.so %{buildroot}%{_prefix}/local/lib64/libXinerama.so.1
 %{_prefix}/local/lib64/libXinerama.so.1
 
 %changelog
+* Tue Jul 07 2026 DigitalCyberSoft <digitalcybersoft@proton.me> - 0.3.0-1
+- Add split-layout presets to the editor (2/3 columns, 2/3 rows, 2x2, and
+  two "main + 2" variants) as one-click buttons.
+- Require /usr/bin/gdbus (provided by glib2): cinnamon_compat invokes the
+  gdbus CLI at runtime. Makes the dependency explicit and resolvable; the
+  bare capability "gdbus" that broke earlier snapshot installs is not
+  provided by any package.
+
 * Sat Feb 07 2026 DigitalCyberSoft <digitalcybersoft@proton.me> - 0.1.0-1
 - Initial RPM package
