@@ -165,13 +165,24 @@ CONFIG_PATH = os.path.join(
 
 
 def _find_fakexrandr_lib():
-    """Find the fakexrandr libXrandr.so.2 in the splitrandr project tree."""
-    # Look relative to this module's location
+    """Find the fakexrandr libXrandr.so.2, whether running from the source
+    tree or installed from the RPM."""
+    # Source tree: the built .so sits in <project>/fakexrandr/ next to the
+    # Python package. Checked first so a dev run prefers the freshly built
+    # local library over any system-installed copy.
     module_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.dirname(module_dir)
     candidates = [
         os.path.join(project_dir, 'fakexrandr', 'libXrandr.so.2'),
         os.path.join(project_dir, 'fakexrandr', 'libXrandr.so'),
+        # Installed via RPM: the spec (splitrandr-copr's .copr/Makefile)
+        # installs the .so to %{_prefix}/local/lib64. Without these the
+        # installed package never finds its own library, so LD_PRELOAD is
+        # never set and splitting silently does nothing.
+        '/usr/local/lib64/libXrandr.so.2',
+        '/usr/local/lib64/libXrandr.so',
+        '/usr/local/lib/libXrandr.so.2',
+        '/usr/local/lib/libXrandr.so',
     ]
     for path in candidates:
         if os.path.isfile(path):
