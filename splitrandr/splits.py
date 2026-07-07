@@ -319,12 +319,44 @@ class SplitTree:
             leaf.primary = (i == index)
 
 
+def _draw_tree_icon(cr, tree, w, h):
+    """Render a SplitTree as a small preview swatch: filled leaf regions with
+    black outlines on a dark background. Used for the preset picker buttons."""
+    cr.set_source_rgb(0.2, 0.2, 0.2)
+    cr.rectangle(0, 0, w, h)
+    cr.fill()
+    for i, (px, py, pw, ph) in enumerate(tree.leaf_regions_proportional()):
+        cr.set_source_rgba(*SPLIT_COLORS[i % len(SPLIT_COLORS)], 0.85)
+        cr.rectangle(px * w, py * h, pw * w, ph * h)
+        cr.fill()
+        cr.set_source_rgb(0, 0, 0)
+        cr.set_line_width(1)
+        cr.rectangle(px * w, py * h, pw * w, ph * h)
+        cr.stroke()
+
+
 class SplitEditorDialog(Gtk.Dialog):
     """Dialog for interactively editing monitor splits.
     Adapted from fakexrandr-manage.py's ConfigurationWidget.
     """
 
     CANVAS_WIDTH = 300
+
+    # Preset layouts offered as one-click buttons. Each value is a factory
+    # returning a FRESH SplitTree so applying a preset never shares a node
+    # with the editable tree. 'V' = vertical divider (columns), 'H' =
+    # horizontal divider (rows). "Single" (no split) is the Reset button.
+    PRESETS = [
+        ("2 columns",        lambda: SplitTree('V', 0.5)),
+        ("2 rows",           lambda: SplitTree('H', 0.5)),
+        ("3 columns",        lambda: SplitTree('V', 1 / 3, right=SplitTree('V', 0.5))),
+        ("2 x 2 grid",       lambda: SplitTree('V', 0.5,
+                                               left=SplitTree('H', 0.5),
+                                               right=SplitTree('H', 0.5))),
+        ("Main + 2 (right)", lambda: SplitTree('V', 0.6, right=SplitTree('H', 0.5))),
+        ("Main + 2 (below)", lambda: SplitTree('H', 0.6, right=SplitTree('V', 0.5))),
+        ("3 rows",           lambda: SplitTree('H', 1 / 3, right=SplitTree('H', 0.5))),
+    ]
 
     def __init__(self, parent, output_name, width, height, split_tree=None):
         super().__init__(
@@ -366,9 +398,38 @@ class SplitEditorDialog(Gtk.Dialog):
             "<small>Drag inside a region to split it. Drag an existing line "
             "to resize. Right-click a line to remove. Ctrl+Z to undo.</small>"
         )
+        # Wrap so the long hint doesn't force the dialog wider than the
+        # preview canvas (leaving dead space beside it).
+        label.set_line_wrap(True)
+        label.set_max_width_chars(44)
         label.set_margin_top(6)
         label.set_margin_bottom(6)
         content.pack_start(label, False, False, 0)
+
+        # Preset picker: one click applies a common split layout, replacing
+        # the current tree (undoable). Fine-tune afterwards by dragging.
+        presets_caption = Gtk.Label()
+        presets_caption.set_markup("<small>Presets:</small>")
+        presets_caption.set_halign(Gtk.Align.START)
+        presets_caption.set_margin_start(12)
+        content.pack_start(presets_caption, False, False, 0)
+
+        # FlowBox so the icon row wraps to the canvas width instead of
+        # forcing the dialog wider than the preview. Selection disabled —
+        # clicks are handled by the inner buttons, not the FlowBox.
+        presets_box = Gtk.FlowBox()
+        presets_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        presets_box.set_max_children_per_line(4)
+        presets_box.set_min_children_per_line(1)
+        presets_box.set_row_spacing(6)
+        presets_box.set_column_spacing(6)
+        presets_box.set_margin_start(12)
+        presets_box.set_margin_end(12)
+        presets_box.set_margin_bottom(6)
+        for preset_name, preset_builder in self.PRESETS:
+            presets_box.insert(
+                self._make_preset_button(preset_name, preset_builder), -1)
+        content.pack_start(presets_box, False, False, 0)
 
         self._drawing_area = Gtk.DrawingArea()
         self._drawing_area.set_size_request(self.CANVAS_WIDTH, self._canvas_height)
@@ -431,6 +492,30 @@ class SplitEditorDialog(Gtk.Dialog):
         """Replace the tree with a single leaf, pushing the prior state to undo."""
         self._push_undo()
         self._tree = SplitTree.new_leaf()
+        self._drawing_area.queue_draw()
+
+    def _make_preset_button(self, name, builder):
+        """Icon button that applies preset `builder` (a fresh-tree factory)."""
+        button = Gtk.Button()
+        button.set_tooltip_text(name)
+        icon = Gtk.DrawingArea()
+        icon.set_size_request(40, 26)
+        preview = builder()  # display-only instance; never edited
+        icon.connect(
+            "draw",
+            lambda widget, cr: _draw_tree_icon(
+                cr, preview,
+                widget.get_allocated_width(),
+                widget.get_allocated_height()) or False,
+        )
+        button.add(icon)
+        button.connect("clicked", lambda b: self._apply_preset(builder))
+        return button
+
+    def _apply_preset(self, builder):
+        """Replace the tree with a fresh preset layout (undoable)."""
+        self._push_undo()
+        self._tree = builder()
         self._drawing_area.queue_draw()
 
     @property
