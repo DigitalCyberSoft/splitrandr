@@ -719,6 +719,19 @@ XErrorHandler XSetErrorHandler(XErrorHandler handler) {
 	return old;
 }
 
+/*
+	Single constructor. The error-handler bootstrap below calls
+	_XRRQueryExtension, which is bound by FUNCTION_POINTER_INITIALIZATIONS.
+	These were previously two constructors (_init unprioritized, the
+	bootstrap at priority 65535) relying on _init running first. Under LTO
+	(-flto, which Fedora's %optflags enables) GCC merges the two and can
+	emit the priority-65535 body ahead of the unprioritized binding, so the
+	bootstrap dereferenced a NULL _XRRQueryExtension and SEGV'd on load in
+	any process with a reachable X display (including the Cinnamon
+	LD_PRELOAD target). Keeping binding and use in one straight-line
+	function removes the ordering assumption; the _XRRQueryExtension guard
+	is belt-and-suspenders in case the dlsym ever fails.
+*/
 static void _init() __attribute__((constructor));
 static void _init() {
 	void *xrandr_lib = dlopen(REAL_XRANDR_LIB, RTLD_LAZY | RTLD_GLOBAL);
@@ -729,20 +742,15 @@ static void _init() {
 		functions.
 	*/
 	FUNCTION_POINTER_INITIALIZATIONS;
-}
 
-/*
-	Bootstrap: get RandR error base and install our error handler.
-*/
-static void _init_error_handler() __attribute__((constructor(65535)));
-static void _init_error_handler() {
+	/* Bootstrap: get RandR error base and install our error handler. */
 	_real_XSetErrorHandler = dlsym(RTLD_NEXT, "XSetErrorHandler");
 
 	/* Try to get RandR error base from the default display */
 	Display *dpy = XOpenDisplay(NULL);
 	if(dpy) {
 		int event_base;
-		if(_XRRQueryExtension(dpy, &event_base, &_randr_error_base)) {
+		if(_XRRQueryExtension && _XRRQueryExtension(dpy, &event_base, &_randr_error_base)) {
 			/* Success — _randr_error_base is set */
 		}
 		XCloseDisplay(dpy);
