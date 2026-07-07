@@ -165,6 +165,23 @@ class XRandRSaveMixin:
         for name, tree in self.configuration.splits.items():
             self._log_tree(name, tree)
 
+        # Snapshot the on-disk fakexrandr.bin hash BEFORE this apply
+        # rewrites it, so the restart gating at the end of save_to_x can
+        # tell whether THIS apply actually changed the split topology.
+        # Only a real split change needs a cinnamon --replace to refresh
+        # Mutter's MetaMonitor cache. Comparing the post-write hash to a
+        # per-session sentinel instead made the first apply of every
+        # session restart Cinnamon even for changes that don't touch
+        # splits (e.g. disabling a non-split output like eDP), and that
+        # restart re-enabled the output, so it "never turned off".
+        import hashlib
+        from .fakexrandr_config import CONFIG_PATH
+        try:
+            with open(CONFIG_PATH, 'rb') as _f:
+                self._pre_apply_bin_hash = hashlib.sha1(_f.read()).hexdigest()
+        except (FileNotFoundError, OSError):
+            self._pre_apply_bin_hash = ''
+
         # Disable csd-xrandr and freeze Cinnamon BEFORE any xrandr changes.
         # If we run the main xrandr command first, CSD-xrandr reacts to the
         # RandR event and re-applies the OLD monitors.xml, clobbering our
@@ -359,8 +376,13 @@ class XRandRSaveMixin:
                     current_bin_hash = hashlib.sha1(f.read()).hexdigest()
             except FileNotFoundError:
                 current_bin_hash = ''
-            last_hash = getattr(self, '_last_applied_bin_hash', None)
-            bin_changed = current_bin_hash != last_hash
+            # Restart only when THIS apply changed the bin (split topology
+            # changed), not merely because it differs from a per-session
+            # sentinel. _pre_apply_bin_hash was captured before the write
+            # above; disabling a non-split output leaves the bin identical,
+            # so bin_changed stays False and Cinnamon is not restarted.
+            prev_hash = getattr(self, '_pre_apply_bin_hash', '')
+            bin_changed = current_bin_hash != prev_hash
 
             so_stale = has_splits and not is_cinnamon_fakexrandr_current()
 
@@ -377,8 +399,6 @@ class XRandRSaveMixin:
             elif not has_splits and is_cinnamon_fakexrandr_loaded():
                 log.info("no splits active, restarting Cinnamon without fakexrandr")
                 restart_cinnamon_without_fakexrandr()
-
-            self._last_applied_bin_hash = current_bin_hash
         except Exception as e:
             log.warning("fakexrandr cinnamon restart failed: %s", e)
 

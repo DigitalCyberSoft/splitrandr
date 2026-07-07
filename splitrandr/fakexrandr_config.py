@@ -84,6 +84,31 @@ def _get_so_config_version(lib_path):
         return 0
 
 
+# The real libX{randr,inerama} always live in a system library dir; our
+# fakexrandr shim is deliberately installed outside the default linker path
+# (historically site-packages/fakexrandr/, now /usr/local/lib64 per the COPR
+# spec). Anything named like the X libs but mapped from outside these dirs is
+# ours.
+_SYSTEM_LIB_DIRS = ('/usr/lib64/', '/lib64/', '/usr/lib/', '/lib/')
+
+
+def _is_fake_xrandr_lib_path(path):
+    """True if a mapped file path is our fakexrandr shim, not the real X lib.
+
+    Detecting by the literal substring 'fakexrandr' broke once the RPM moved
+    the .so to /usr/local/lib64/libXrandr.so, whose path contains no such
+    substring: Cinnamon had the shim loaded but is_cinnamon_fakexrandr_loaded()
+    reported False, causing a spurious cinnamon --replace on every apply.
+    """
+    base = os.path.basename(path)
+    if not (base.startswith('libXrandr.so')
+            or base.startswith('libXinerama.so')):
+        return False
+    if 'fakexrandr' in path:  # legacy site-packages/fakexrandr/ layout
+        return True
+    return not any(path.startswith(d) for d in _SYSTEM_LIB_DIRS)
+
+
 def _get_cinnamon_fakexrandr_path():
     """Find the fakexrandr .so path loaded in Cinnamon's process.
 
@@ -96,19 +121,15 @@ def _get_cinnamon_fakexrandr_path():
     try:
         with open(f'/proc/{pid}/maps', 'r') as f:
             for line in f:
-                if 'fakexrandr' not in line:
-                    continue
                 # Format: addr perms offset dev inode path
-                parts = line.split()
-                if len(parts) >= 6:
-                    path = parts[5]
-                    # Only match shared library files, not config files
-                    if not (path.endswith('.so') or '.so.' in path
-                            or path.endswith('.so (deleted)')):
-                        continue
-                    # The path may end with " (deleted)" if .so was replaced
-                    if path.endswith('(deleted)'):
-                        path = path.rsplit(' ', 1)[0].strip()
+                parts = line.split(maxsplit=5)
+                if len(parts) < 6:
+                    continue
+                path = parts[5].rstrip('\n')
+                # The path may end with " (deleted)" if the .so was replaced
+                if path.endswith(' (deleted)'):
+                    path = path[:-len(' (deleted)')]
+                if _is_fake_xrandr_lib_path(path):
                     return path
     except (OSError, PermissionError):
         pass

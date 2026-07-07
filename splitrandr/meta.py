@@ -17,7 +17,7 @@
 from .i18n import _
 
 
-__version__ = '0.3.2'
+__version__ = '0.3.3'
 PROGRAMNAME = _('SplitRandR')
 PROGRAMDESCRIPTION = _('Monitor Layout Editor with Virtual Monitor Splitting')
 COPYRIGHT = 'Based on ARandR by chrysn 2008-2019'
