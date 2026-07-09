@@ -37,6 +37,17 @@ def _run_watch():
     """Run headless screen watcher that re-applies layout on unlock/wake."""
     # Initialize GDK so Gdk.Screen monitors-changed signals work
     Gdk.init([])
+    # Ensure the lock screen carries splitrandr's fakexrandr shim. Installed
+    # once per session here because cinnamon-screensaver is D-Bus activated
+    # with no preload by default; without this it sees the real unsplit
+    # outputs and can wedge on display hotplug. See
+    # fakexrandr_config.write_screensaver_dbus_override.
+    try:
+        from .fakexrandr_config import write_screensaver_dbus_override
+        if write_screensaver_dbus_override():
+            print("Installed cinnamon-screensaver fakexrandr override")
+    except Exception as e:
+        print("Warning: could not install screensaver override: %s" % e)
     watcher = ScreenWatcher()
     active = profiles.get_active_profile()
     if active:

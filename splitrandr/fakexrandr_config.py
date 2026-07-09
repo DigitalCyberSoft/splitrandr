@@ -211,6 +211,127 @@ def _find_fakexrandr_lib():
     return None
 
 
+# ---------------------------------------------------------------------------
+# cinnamon-screensaver fakexrandr injection
+# ---------------------------------------------------------------------------
+#
+# muffin sees the virtual split monitors because splitrandr restarts it with
+# LD_PRELOAD=<fakexrandr libXrandr.so.2> (restart_cinnamon_with_fakexrandr).
+# cinnamon-screensaver, though, is D-Bus activated from
+# /usr/share/dbus-1/services/org.cinnamon.ScreenSaver.service with a bare
+# `Exec=/usr/bin/cinnamon-screensaver` and NO preload, so the lock screen
+# computes its geometry from the real, unsplit outputs. When the split and
+# unsplit monitor rects disagree the screensaver logs
+# "Screen rect ... and monitor rects ... DO NOT add up" and can fall back to
+# cs-backup-locker — a bare black grab with no unlock UI, i.e. an
+# unrecoverable lock on display hotplug.
+#
+# Fix: a user-level D-Bus service override (files under $XDG_DATA_HOME shadow
+# the system service file for the session bus) that injects the SAME
+# fakexrandr .so into the screensaver. cs-backup-locker inherits it as a
+# child. Delete the file and reload dbus to restore the stock screensaver.
+
+SCREENSAVER_DBUS_NAME = "org.cinnamon.ScreenSaver"
+SCREENSAVER_EXEC = "/usr/bin/cinnamon-screensaver"
+SCREENSAVER_FAKEXRANDR_LOG = "/tmp/fakexrandr-screensaver.log"
+
+
+def _screensaver_override_path():
+    """Path of the user D-Bus service override for cinnamon-screensaver.
+
+    Uses $XDG_DATA_HOME (default ~/.local/share); a service file there
+    shadows /usr/share/dbus-1/services/<name>.service on the session bus.
+    """
+    data_home = (os.environ.get('XDG_DATA_HOME')
+                 or os.path.expanduser('~/.local/share'))
+    return os.path.join(data_home, 'dbus-1', 'services',
+                        SCREENSAVER_DBUS_NAME + '.service')
+
+
+def _screensaver_override_content(lib_path):
+    return (
+        "[D-BUS Service]\n"
+        "Name=%s\n"
+        "# Managed by splitrandr (%s). Injects the fakexrandr LD_PRELOAD so the\n"
+        "# lock screen sees the same virtual split monitors as muffin; without\n"
+        "# it the screensaver's rects 'DO NOT add up' and it can wedge on\n"
+        "# hotplug. Delete this file and reload dbus for the stock screensaver.\n"
+        "Exec=/usr/bin/env LD_PRELOAD=%s FAKEXRANDR_LOG=%s %s\n"
+        % (SCREENSAVER_DBUS_NAME, __name__, lib_path,
+           SCREENSAVER_FAKEXRANDR_LOG, SCREENSAVER_EXEC)
+    )
+
+
+def write_screensaver_dbus_override(lib_path=None, activate=True):
+    """Install/refresh the cinnamon-screensaver D-Bus override that preloads
+    fakexrandr, so the lock screen sees splitrandr's virtual monitors.
+
+    Idempotent: only rewrites when the content changes. When it does change
+    and ``activate`` is set, the session bus is asked to reload its service
+    files and any running cinnamon-screensaver is terminated so the next
+    activation picks up the preload. The daemon re-activates on demand
+    (idle/lock/query) — this does not lock the screen.
+
+    Returns True if the override was written or updated, False otherwise.
+    """
+    if lib_path is None:
+        lib_path = _find_fakexrandr_lib()
+    if not lib_path:
+        log.warning("fakexrandr library not found; "
+                    "skipping screensaver D-Bus override")
+        return False
+
+    dest = _screensaver_override_path()
+    content = _screensaver_override_content(lib_path)
+
+    try:
+        with open(dest) as f:
+            if f.read() == content:
+                return False  # already current
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("could not read %s: %s", dest, e)
+
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(content)
+        os.replace(tmp, dest)
+    except OSError as e:
+        log.warning("failed to write screensaver override %s: %s", dest, e)
+        return False
+
+    log.info("installed screensaver fakexrandr override -> %s (LD_PRELOAD=%s)",
+             dest, lib_path)
+
+    if activate:
+        _activate_screensaver_override()
+    return True
+
+
+def _activate_screensaver_override():
+    """Reload the session bus service files and drop any running
+    cinnamon-screensaver so the override takes effect on next activation."""
+    try:
+        subprocess.run(
+            ['dbus-send', '--session', '--type=method_call',
+             '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus',
+             'org.freedesktop.DBus.ReloadConfig'],
+            capture_output=True, timeout=5)
+    except Exception as e:
+        log.warning("dbus ReloadConfig failed: %s", e)
+    # Drop the running daemon so it re-activates with the preload. Match on
+    # the exact executable path so csd-screensaver-proxy and the
+    # cs-backup-locker helper (different argv) are left alone.
+    try:
+        subprocess.run(['pkill', '-f', '/cinnamon-screensaver$'],
+                       capture_output=True, timeout=5)
+    except Exception as e:
+        log.warning("could not restart cinnamon-screensaver: %s", e)
+
+
 def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
     """Write ~/.config/fakexrandr.bin from the current split configuration.
 
@@ -524,6 +645,11 @@ def restart_cinnamon_with_fakexrandr(lib_path=None):
     if not lib_path:
         log.warning("fakexrandr library not found, skipping Cinnamon restart")
         return False
+
+    # Keep the lock screen in lockstep: give cinnamon-screensaver the same
+    # fakexrandr preload path muffin is about to get, so it sees the split
+    # monitors instead of wedging when they change under a lock.
+    write_screensaver_dbus_override(lib_path)
 
     env = os.environ.copy()
     existing = env.get('LD_PRELOAD', '')

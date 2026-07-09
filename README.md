@@ -129,6 +129,35 @@ The vendored fakexrandr intercepts at two levels:
 
 Fake XIDs use the upper bits (`XID_SPLIT_MASK = 0x7FE00000`) to distinguish them from real XIDs.
 
+### Lock screen (cinnamon-screensaver)
+
+fakexrandr only affects processes it is `LD_PRELOAD`ed into. Muffin gets it
+via `restart_cinnamon_with_fakexrandr`, but **cinnamon-screensaver** is D-Bus
+activated from `/usr/share/dbus-1/services/org.cinnamon.ScreenSaver.service`
+with a bare `Exec=/usr/bin/cinnamon-screensaver` and no preload. Left alone,
+the lock screen computes its geometry from the *real, unsplit* outputs while
+muffin uses the split ones. On a display hotplug the two disagree, the
+screensaver logs `Screen rect ... and monitor rects ... DO NOT add up`, and it
+can fall back to `cs-backup-locker` — a bare black grab with **no unlock UI**,
+i.e. an unrecoverable lock.
+
+`fakexrandr_config.write_screensaver_dbus_override()` fixes this by writing a
+user-level D-Bus service override to
+`~/.local/share/dbus-1/services/org.cinnamon.ScreenSaver.service` (files under
+`$XDG_DATA_HOME` shadow the system service file for the session bus). The
+override injects the **same** `LD_PRELOAD` path muffin uses — resolved once via
+`_find_fakexrandr_lib()`, so dev-tree and RPM installs stay consistent — and
+`cs-backup-locker` inherits it as a child. It is generated at runtime rather
+than shipped as a static file precisely because that `.so` path differs
+between a source checkout and an installed package.
+
+It is written idempotently from two places: `restart_cinnamon_with_fakexrandr`
+(so the lock screen tracks muffin whenever the layout is applied) and the
+`--watch` startup (so every session has it). When the file changes, the
+session bus is asked to `ReloadConfig` and any running screensaver is dropped
+so the next on-demand activation carries the preload — this does not lock the
+screen. Delete the file and reload dbus to restore the stock screensaver.
+
 ## Design issues and limitations
 
 ### It probably won't work on your system without tweaking
