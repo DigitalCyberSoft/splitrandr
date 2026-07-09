@@ -37,6 +37,15 @@ def _run_watch():
     """Run headless screen watcher that re-applies layout on unlock/wake."""
     # Initialize GDK so Gdk.Screen monitors-changed signals work
     Gdk.init([])
+    from . import compositor
+    comp = compositor.current()
+    print("Detected compositor: %s" % comp.kind)
+    if compositor.session_is_wayland():
+        # fakexrandr is X11-only — it intercepts libXrandr/libxcb-randr, which
+        # a Wayland compositor never calls. Nothing splitrandr does will take
+        # effect. Warn loudly rather than fail silently.
+        print("Warning: this is a Wayland session; fakexrandr splits cannot "
+              "work here. Log in with an Xorg session (e.g. 'GNOME on Xorg').")
     # Ensure the lock screen carries splitrandr's fakexrandr shim. Installed
     # once per session here because cinnamon-screensaver is D-Bus activated
     # with no preload by default; without this it sees the real unsplit
@@ -133,7 +142,8 @@ def _regenerate_config():
         write_cinnamon_monitors_xml(
             xrandr.configuration.splits, xrandr.state, xrandr.configuration, borders
         )
-        print("Updated cinnamon-monitors.xml")
+        from .compositor import current as _current_compositor
+        print("Updated %s" % _current_compositor().monitors_xml_path)
     except Exception as e:
         print("Warning: failed to update configs: %s" % e)
 

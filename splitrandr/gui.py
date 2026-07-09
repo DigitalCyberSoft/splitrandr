@@ -214,7 +214,7 @@ def main():
     )
     parser.add_option(
         '--update-configs',
-        help='Write fakexrandr.bin and cinnamon-monitors.xml from current X state, then exit',
+        help="Write fakexrandr.bin and the compositor's monitors.xml from current X state, then exit",
         action='store_true'
     )
     parser.add_option(

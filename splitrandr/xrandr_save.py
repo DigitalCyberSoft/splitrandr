@@ -20,6 +20,7 @@ import logging
 from .auxiliary import InadequateConfiguration
 from .splits import SplitTree
 from .i18n import _
+from . import compositor
 
 log = logging.getLogger('splitrandr')
 
@@ -97,34 +98,49 @@ class XRandRSaveMixin:
                 border_comments.append(
                     '# splitrandr-border:%s=%d' % (output_name, border_val))
 
-        # Generate Cinnamon-safe wrapper for setmonitor commands
-        # Muffin >= 5.4.0 segfaults on setmonitor events, so we
-        # SIGSTOP Cinnamon and disable csd-xrandr during these calls.
+        # Generate a compositor-safe wrapper for setmonitor commands. On
+        # affected Cinnamon (Muffin >= 5.4.0 segfaults on setmonitor events)
+        # we SIGSTOP the shell and silence the settings-daemon xrandr plugin
+        # across the calls. GNOME/Mutter needs neither, so the freeze and the
+        # (Cinnamon-only) xapp-sn-watcher restart are omitted there.
         if del_lines or set_lines:
             monitor_cmds = '\n'.join(del_lines + set_lines)
+            comp = compositor.current()
+            border_block = ('\n'.join(border_comments) + '\n'
+                            if border_comments else '')
+            if comp.needs_setmonitor_sigstop_guard:
+                freeze = (
+                    '# Compositor safety: freeze the shell during setmonitor calls\n'
+                    'SHELL_PID=$(pgrep -x %(shell)s 2>/dev/null)\n'
+                    'if [ -n "$SHELL_PID" ]; then\n'
+                    '  gsettings set %(csd)s active false 2>/dev/null\n'
+                    '  # Wait for gsettings to propagate\n'
+                    '  _i=0; while [ "$_i" -lt 20 ]; do\n'
+                    '    _v=$(gsettings get %(csd)s active 2>/dev/null)\n'
+                    '    [ "$_v" = "false" ] && break\n'
+                    '    sleep 0.05; _i=$((_i+1))\n'
+                    '  done\n'
+                    '  kill -STOP "$SHELL_PID" 2>/dev/null\n'
+                    'fi\n'
+                ) % {'shell': comp.shell_process, 'csd': comp.csd_xrandr_schema}
+                thaw = (
+                    'if [ -n "$SHELL_PID" ]; then\n'
+                    '  # X server round-trip to flush pending RandR events\n'
+                    '  xrandr --listmonitors >/dev/null 2>&1\n'
+                    '  kill -CONT "$SHELL_PID" 2>/dev/null\n'
+                    'fi\n'
+                    '# Restart xapp-sn-watcher so AppIndicator3 menus use new layout\n'
+                    'pkill -x xapp-sn-watcher 2>/dev/null || true\n'
+                )
+            else:
+                freeze = ''
+                thaw = ''
             cinnamon_safe = (
-                '# Cinnamon safety: freeze Cinnamon during setmonitor calls\n'
-                'CINNAMON_PID=$(pgrep -x cinnamon 2>/dev/null)\n'
-                'if [ -n "$CINNAMON_PID" ]; then\n'
-                '  gsettings set org.cinnamon.settings-daemon.plugins.xrandr active false 2>/dev/null\n'
-                '  # Wait for gsettings to propagate\n'
-                '  _i=0; while [ "$_i" -lt 20 ]; do\n'
-                '    _v=$(gsettings get org.cinnamon.settings-daemon.plugins.xrandr active 2>/dev/null)\n'
-                '    [ "$_v" = "false" ] && break\n'
-                '    sleep 0.05; _i=$((_i+1))\n'
-                '  done\n'
-                '  kill -STOP "$CINNAMON_PID" 2>/dev/null\n'
-                'fi\n'
+                freeze
                 + monitor_cmds + '\n'
-                + ('\n'.join(border_comments) + '\n' if border_comments else '')
-                + 'if [ -n "$CINNAMON_PID" ]; then\n'
-                '  # X server round-trip to flush pending RandR events\n'
-                '  xrandr --listmonitors >/dev/null 2>&1\n'
-                '  kill -CONT "$CINNAMON_PID" 2>/dev/null\n'
-                'fi\n'
-                '# Restart xapp-sn-watcher so AppIndicator3 menus use new monitor layout\n'
-                'pkill -x xapp-sn-watcher 2>/dev/null || true\n'
-                '# Write fakexrandr.bin and cinnamon-monitors.xml to match\n'
+                + border_block
+                + thaw
+                + '# Write fakexrandr.bin and monitors.xml to match\n'
                 'python3 -m splitrandr --update-configs 2>/dev/null || true'
             )
         else:

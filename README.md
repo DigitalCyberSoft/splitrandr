@@ -158,6 +158,40 @@ session bus is asked to `ReloadConfig` and any running screensaver is dropped
 so the next on-demand activation carries the preload — this does not lock the
 screen. Delete the file and reload dbus to restore the stock screensaver.
 
+### Running on GNOME (Xorg)
+
+Muffin is a fork of Mutter, so the same machinery drives GNOME with only names
+and paths swapped. `compositor.py` centralizes that: it detects the desktop
+(`XDG_CURRENT_DESKTOP`, falling back to sniffing the running shell, defaulting
+to Cinnamon) and exposes the per-DE values every other module consults —
+
+| | Cinnamon | GNOME |
+|---|---|---|
+| shell / restart | `cinnamon --replace` | `gnome-shell --replace` |
+| DisplayConfig bus | `org.cinnamon.Muffin.DisplayConfig` | `org.gnome.Mutter.DisplayConfig` |
+| persisted layout | `~/.config/cinnamon-monitors.xml` | `~/.config/monitors.xml` |
+| readiness probe | `org.Cinnamon.Eval` | `org.gnome.Shell` Peer.Ping (Eval is disabled) |
+| settings-daemon xrandr fight | disable the gsd plugin | none (folded into Mutter) |
+| setmonitor SIGSTOP guard (muffin#532) | **yes** | no |
+| separate screensaver override | **yes** | no (lock is inside gnome-shell) |
+| panel pinning | yes | no |
+
+The last four are capability flags that are False on GNOME, so those
+Cinnamon-only workarounds become no-ops. The DE-neutral pieces — the
+`fakexrandr.bin` format, the split tree, the xcb-randr interception, and
+unlock/wake re-apply — are unchanged.
+
+**Hard constraint: Xorg only.** fakexrandr is an `LD_PRELOAD` shim over
+libXrandr/libxcb-randr; a Wayland compositor never makes those calls, so
+splitrandr cannot work under Wayland at all. GNOME defaults to Wayland — you
+must pick **"GNOME on Xorg"** at the login screen. The watcher logs a warning
+(`compositor.session_is_wayland`) when it detects a Wayland session.
+
+> GNOME support is wired but **untested on real GNOME hardware** — it was
+> developed and verified on Cinnamon. The Mutter-specific unknowns (does
+> `--setmonitor` need the SIGSTOP guard? does its mode-list cache go stale the
+> same way?) can only be settled by running it on GNOME-on-Xorg.
+
 ## Design issues and limitations
 
 ### It probably won't work on your system without tweaking

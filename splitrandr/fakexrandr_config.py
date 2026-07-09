@@ -15,6 +15,8 @@ import ctypes
 import time
 import xml.etree.ElementTree as ET
 
+from . import compositor
+
 log = logging.getLogger('splitrandr')
 
 # Must match _fakexrandr_config_version in libXrandr.c
@@ -274,6 +276,10 @@ def write_screensaver_dbus_override(lib_path=None, activate=True):
 
     Returns True if the override was written or updated, False otherwise.
     """
+    # GNOME draws the lock screen inside gnome-shell (which already carries
+    # the preload); there is no separate screensaver process to override.
+    if not compositor.current().needs_screensaver_override:
+        return False
     if lib_path is None:
         lib_path = _find_fakexrandr_lib()
     if not lib_path:
@@ -481,12 +487,6 @@ def _parse_edid_monitorspec(edid_hex):
     return (vendor, product, serial)
 
 
-MONITORS_XML_PATH = os.path.join(
-    os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')),
-    'cinnamon-monitors.xml'
-)
-
-
 def _ensure_one_primary(config_elem):
     """Mutter SIGSEGVs in meta_display_logical_index_to_xinerama_index
     when a <configuration> has no <primary> child anywhere. Promote the
@@ -587,13 +587,13 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, border
 
     _indent_xml(root)
     tree_obj = ET.ElementTree(root)
-    config_dir = os.path.dirname(MONITORS_XML_PATH)
+    xml_path = compositor.current().monitors_xml_path
+    config_dir = os.path.dirname(xml_path)
     os.makedirs(config_dir, exist_ok=True)
-    tmp_path = MONITORS_XML_PATH + '.tmp'
+    tmp_path = xml_path + '.tmp'
     tree_obj.write(tmp_path, encoding='unicode', xml_declaration=False)
-    os.replace(tmp_path, MONITORS_XML_PATH)
-    log.info("wrote cinnamon-monitors.xml: %s (parent outputs=%d)",
-             MONITORS_XML_PATH, count)
+    os.replace(tmp_path, xml_path)
+    log.info("wrote %s (parent outputs=%d)", xml_path, count)
 
 
 def _add_logicalmonitor(parent, connector, vendor, product, serial,
@@ -635,11 +635,12 @@ def _indent_xml(elem, level=0):
 
 
 def restart_cinnamon_with_fakexrandr(lib_path=None):
-    """Restart Cinnamon with fakexrandr LD_PRELOAD.
+    """Restart the shell (Cinnamon/GNOME) with fakexrandr LD_PRELOAD.
 
     Args:
         lib_path: Path to libXrandr.so.2. If None, auto-detect.
     """
+    comp = compositor.current()
     if lib_path is None:
         lib_path = _find_fakexrandr_lib()
     if not lib_path:
@@ -679,10 +680,10 @@ def restart_cinnamon_with_fakexrandr(lib_path=None):
         log.warning("could not open /tmp/cinnamon.log: %s", e)
         cinnamon_log = subprocess.DEVNULL
 
-    log.info("restarting Cinnamon with LD_PRELOAD=%s FAKEXRANDR_LOG=%s",
-             env['LD_PRELOAD'], env['FAKEXRANDR_LOG'])
+    log.info("restarting %s with LD_PRELOAD=%s FAKEXRANDR_LOG=%s",
+             comp.shell_process, env['LD_PRELOAD'], env['FAKEXRANDR_LOG'])
     subprocess.Popen(
-        ['cinnamon', '--replace'], env=env,
+        comp.restart_argv, env=env,
         start_new_session=True,
         stdout=cinnamon_log, stderr=cinnamon_log,
     )
@@ -706,9 +707,9 @@ def restart_cinnamon_without_fakexrandr():
     # Reap any zombie cinnamon children from previous restarts
     _reap_children()
 
-    log.info("restarting Cinnamon without fakexrandr")
+    log.info("restarting %s without fakexrandr", compositor.current().shell_process)
     subprocess.Popen(
-        ['cinnamon', '--replace'], env=env,
+        compositor.current().restart_argv, env=env,
         start_new_session=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )

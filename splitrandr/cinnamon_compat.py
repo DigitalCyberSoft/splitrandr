@@ -21,6 +21,8 @@ import subprocess
 import time
 import logging
 
+from . import compositor
+
 log = logging.getLogger('splitrandr')
 
 
@@ -148,7 +150,7 @@ def _get_cinnamon_pid():
     candidates = []
     try:
         result = subprocess.run(
-            ['pgrep', '-x', 'cinnamon'],
+            ['pgrep', '-x', compositor.current().shell_process],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0:
@@ -186,10 +188,10 @@ def _get_cinnamon_pid():
 
 
 def _pid_is_cinnamon(pid):
-    """Check that a PID still belongs to a cinnamon process."""
+    """Check that a PID still belongs to the running shell process."""
     try:
         with open('/proc/%d/comm' % pid) as f:
-            return f.read().strip() == 'cinnamon'
+            return f.read().strip() == compositor.current().shell_process
     except (OSError, PermissionError):
         return False
 
@@ -214,46 +216,50 @@ def _poll_until(predicate, timeout, interval=0.1, description=""):
 
 
 def _wait_cinnamon_on_dbus(timeout=15.0):
-    """Wait for Cinnamon's JS engine to be ready on D-Bus.
+    """Wait for the shell to be ready on D-Bus after a ``--replace`` restart.
 
-    Polls org.Cinnamon.Eval to check that the JS engine is up.
-    Falls back to org.freedesktop.DBus.Peer.Ping.
-    Returns True if Cinnamon responded, False on timeout.
+    On Cinnamon, polls org.Cinnamon.Eval (JS engine up). On GNOME, whose
+    shell disables unrestricted Eval, skips straight to Peer.Ping. Both fall
+    back to Peer.Ping on the shell's well-known name. Returns True if the
+    shell responded, False on timeout.
     """
-    log.info("waiting for Cinnamon D-Bus readiness (timeout=%.0fs)", timeout)
+    comp = compositor.current()
+    log.info("waiting for %s D-Bus readiness (timeout=%.0fs)",
+             comp.shell_bus_name, timeout)
 
-    def _cinnamon_eval_ready():
+    if comp.supports_eval:
+        def _eval_ready():
+            result = subprocess.run(
+                ['gdbus', 'call', '--session',
+                 '--dest', comp.shell_bus_name,
+                 '--object-path', comp.shell_bus_path,
+                 '--method', comp.shell_bus_name + '.Eval',
+                 'global.display.get_n_monitors()'],
+                capture_output=True, text=True, timeout=3
+            )
+            return result.returncode == 0
+
+        if _poll_until(_eval_ready, timeout, interval=0.25,
+                       description="%s D-Bus Eval readiness" % comp.shell_bus_name):
+            log.info("%s is ready on D-Bus", comp.shell_bus_name)
+            return True
+        log.info("Eval failed, trying D-Bus Peer.Ping fallback")
+
+    def _ping_ready():
         result = subprocess.run(
             ['gdbus', 'call', '--session',
-             '--dest', 'org.Cinnamon',
-             '--object-path', '/org/Cinnamon',
-             '--method', 'org.Cinnamon.Eval',
-             'global.display.get_n_monitors()'],
-            capture_output=True, text=True, timeout=3
-        )
-        return result.returncode == 0
-
-    if _poll_until(_cinnamon_eval_ready, timeout, interval=0.25,
-                   description="Cinnamon D-Bus Eval readiness"):
-        log.info("Cinnamon is ready on D-Bus")
-        return True
-
-    # Fallback: try a simpler Ping
-    log.info("Eval failed, trying D-Bus Peer.Ping fallback")
-
-    def _cinnamon_ping_ready():
-        result = subprocess.run(
-            ['gdbus', 'call', '--session',
-             '--dest', 'org.Cinnamon',
-             '--object-path', '/org/Cinnamon',
+             '--dest', comp.shell_bus_name,
+             '--object-path', comp.shell_bus_path,
              '--method', 'org.freedesktop.DBus.Peer.Ping'],
             capture_output=True, text=True, timeout=3
         )
         return result.returncode == 0
 
-    if _poll_until(_cinnamon_ping_ready, 3.0, interval=0.25,
-                   description="Cinnamon D-Bus Ping"):
-        log.info("Cinnamon responded to Ping (Eval may still be initializing)")
+    # On GNOME give Ping the full timeout budget (no Eval phase consumed it).
+    ping_timeout = 3.0 if comp.supports_eval else timeout
+    if _poll_until(_ping_ready, ping_timeout, interval=0.25,
+                   description="%s D-Bus Ping" % comp.shell_bus_name):
+        log.info("%s responded to Ping", comp.shell_bus_name)
         return True
 
     return False
@@ -380,6 +386,9 @@ def pin_panels_to_primary():
     standard config has one panel; that's the case this is tuned
     for.
     """
+    # GNOME's top bar has no panels-enabled knob; nothing to pin.
+    if not compositor.current().has_panels:
+        return
     # Cinnamon's Eval JSON-stringifies the return value automatically;
     # do NOT call JSON.stringify inside the JS or the result is
     # double-encoded. Returns a plain object so json.loads on the
@@ -464,6 +473,9 @@ def is_setmonitor_affected():
 
     Returns True if Muffin >= 5.4.0 is installed and Cinnamon is running.
     """
+    # The muffin#532 crash is Cinnamon-specific; on GNOME the guard is a no-op.
+    if not compositor.current().needs_setmonitor_sigstop_guard:
+        return False
     if not _is_cinnamon_running():
         return False
 
@@ -609,11 +621,12 @@ def mutter_mode_list_matches_layout(splits_dict, xrandr_config):
     from gi.repository import Gio
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        _comp = compositor.current()
         proxy = Gio.DBusProxy.new_sync(
             bus, Gio.DBusProxyFlags.NONE, None,
-            'org.cinnamon.Muffin.DisplayConfig',
-            '/org/cinnamon/Muffin/DisplayConfig',
-            'org.cinnamon.Muffin.DisplayConfig',
+            _comp.displayconfig_name,
+            _comp.displayconfig_path,
+            _comp.displayconfig_iface,
             None,
         )
         state = proxy.call_sync(
@@ -682,11 +695,12 @@ def apply_monitors_via_dbus(splits_dict, xrandr_state, xrandr_config,
 
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        _comp = compositor.current()
         proxy = Gio.DBusProxy.new_sync(
             bus, Gio.DBusProxyFlags.NONE, None,
-            'org.cinnamon.Muffin.DisplayConfig',
-            '/org/cinnamon/Muffin/DisplayConfig',
-            'org.cinnamon.Muffin.DisplayConfig',
+            _comp.displayconfig_name,
+            _comp.displayconfig_path,
+            _comp.displayconfig_iface,
             None,
         )
     except Exception as e:
