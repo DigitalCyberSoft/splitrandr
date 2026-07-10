@@ -1118,9 +1118,17 @@ static int _input_is_setmonitor_vm_to_skip(Display *dpy, XRRScreenResources *res
 			if(has_config) break;
 		}
 	}
-	if(!has_config) return 0;
+	if(!has_config) {
+		FXLOG("  setmonitor-vm '%s' (base '%s'): has_config=0 -> keep (pass through)",
+		      atom_name, base_name);
+		return 0;
+	}
 	/* Only skip when Pass 2 will actually re-emit this output's splits. */
-	return _output_has_automatic_emit_source(dpy, res, orig, orig_count, base_name);
+	int has_auto = _output_has_automatic_emit_source(dpy, res, orig, orig_count, base_name);
+	FXLOG("  setmonitor-vm '%s' (base '%s'): has_config=1 automatic_emit_source=%d -> %s",
+	      atom_name, base_name, has_auto,
+	      has_auto ? "skip (splits will re-emit)" : "keep (no automatic source)");
+	return has_auto;
 }
 
 /*
@@ -1414,12 +1422,36 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 			FXLOG("XRRGetMonitors: passthrough primary override %s -> %d",
 			      atom_name, result[out_idx].primary);
 		}
+		FXLOG("  passthrough[%d] %s automatic=%d noutput=%d primary=%d %dx%d+%d+%d",
+		      out_idx, atom_name, orig[i].automatic, orig[i].noutput,
+		      result[out_idx].primary, result[out_idx].width, result[out_idx].height,
+		      result[out_idx].x, result[out_idx].y);
 		out_idx++;
 		XFree(atom_name);
 	}
 
 	_XRRFreeScreenResources(res);
 	_XRRFreeMonitors(orig);
+
+	/* Bounding box of the emitted monitor set. A screen-size BadMatch
+	   (muffin resizing the framebuffer to a box that disagrees with these
+	   rects) is otherwise invisible without a core dump; log it so the
+	   geometry can be reconciled against mutter's resize attempt. */
+	if(out_idx > 0) {
+		int min_x = result[0].x, min_y = result[0].y;
+		int max_x = result[0].x + result[0].width;
+		int max_y = result[0].y + result[0].height;
+		for(int k = 1; k < out_idx; k++) {
+			int rx = result[k].x + result[k].width;
+			int ry = result[k].y + result[k].height;
+			if(result[k].x < min_x) min_x = result[k].x;
+			if(result[k].y < min_y) min_y = result[k].y;
+			if(rx > max_x) max_x = rx;
+			if(ry > max_y) max_y = ry;
+		}
+		FXLOG("XRRGetMonitors: emitted bbox %dx%d (x %d..%d y %d..%d)",
+		      max_x - min_x, max_y - min_y, min_x, max_x, min_y, max_y);
+	}
 
 	FXLOG("XRRGetMonitors: returning %d monitors (total_outputs=%d)",
 	      out_idx, total_outputs);
