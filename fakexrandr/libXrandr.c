@@ -1066,17 +1066,35 @@ static int _compute_any_splits_will_emit(Display *dpy, XRRMonitorInfo *orig, int
 	return any_splits_will_emit;
 }
 
+/* Forward declarations: the skip predicate below must consult the same
+ * automatic-input emit test that Pass 1/Pass 2 use, but those are defined
+ * further down. */
+static int _pass1_split_count_for_input(Display *dpy, XRRScreenResources *res, const XRRMonitorInfo *m);
+static int _output_has_automatic_emit_source(Display *dpy, XRRScreenResources *res,
+		XRRMonitorInfo *orig, int orig_count, const char *base_name);
+
 /*
 	Predicate for the setmonitor-VM-skip branch shared between
 	Pass 1 and Pass 2. Caller must have already verified the
 	any_splits_will_emit gate plus the (!automatic && name has '~')
-	shape; this helper just performs the base-name lookup against
+	shape; this helper performs the base-name lookup against
 	res->outputs to decide whether splits-emit will replace this
 	input. The two passes MUST call this with identical inputs,
 	otherwise total_monitors and the actual emit count desync and
 	Cinnamon's JS layer crashes.
+
+	Skipping is only safe when an *automatic* input for the same base
+	output is present to re-emit the synthesized splits. In a
+	get_active=1 query the active monitor set can be asymmetric — one
+	output represented only by non-automatic setmonitor VMs with no
+	automatic sibling (observed: HDMI-0~0/~1/~2 present, no automatic
+	HDMI-0). Skipping those VMs then drops the output entirely, because
+	Pass 2 has no automatic input to emit from. In that case the VMs are
+	the output's only coverage and MUST pass through, so a lock/overlay
+	built from XRRGetMonitors covers every physical monitor.
 */
-static int _input_is_setmonitor_vm_to_skip(Display *dpy, XRRScreenResources *res, const char *atom_name) {
+static int _input_is_setmonitor_vm_to_skip(Display *dpy, XRRScreenResources *res,
+		XRRMonitorInfo *orig, int orig_count, const char *atom_name) {
 	struct SplitRegion regions[MAX_SPLITS];
 	/* Strip the ~N suffix to get the base output name */
 	char base_name[128];
@@ -1100,7 +1118,9 @@ static int _input_is_setmonitor_vm_to_skip(Display *dpy, XRRScreenResources *res
 			if(has_config) break;
 		}
 	}
-	return has_config;
+	if(!has_config) return 0;
+	/* Only skip when Pass 2 will actually re-emit this output's splits. */
+	return _output_has_automatic_emit_source(dpy, res, orig, orig_count, base_name);
 }
 
 /*
@@ -1133,6 +1153,29 @@ static int _pass1_split_count_for_input(Display *dpy, XRRScreenResources *res, c
 	}
 	if(oi) _XRRFreeOutputInfo(oi);
 	return count;
+}
+
+/*
+	Returns 1 iff some automatic input monitor resolves to base_name and
+	its CRTC dims match the split config — i.e. Pass 2 WILL emit splits
+	for base_name. Used by the setmonitor-VM-skip predicate so it only
+	discards VMs that a real emit will replace; without this an output
+	whose only monitors are non-automatic setmonitor VMs is dropped.
+*/
+static int _output_has_automatic_emit_source(Display *dpy, XRRScreenResources *res,
+		XRRMonitorInfo *orig, int orig_count, const char *base_name) {
+	for(int i = 0; i < orig_count; i++) {
+		if(!orig[i].automatic || orig[i].noutput <= 0) continue;
+		XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, orig[i].outputs[0]);
+		int match = 0;
+		if(oi && oi->name && strcmp(oi->name, base_name) == 0) {
+			if(_pass1_split_count_for_input(dpy, res, &orig[i]) > 0)
+				match = 1;
+		}
+		if(oi) _XRRFreeOutputInfo(oi);
+		if(match) return 1;
+	}
+	return 0;
 }
 
 /*
@@ -1289,7 +1332,7 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 		 * manager segfaults in meta_display_logical_index_to_xinerama_index
 		 * because the monitor count drops below what was previously seen. */
 		if(any_splits_will_emit && !orig[i].automatic && strchr(atom_name, '~')) {
-			if(_input_is_setmonitor_vm_to_skip(dpy, res, atom_name)) {
+			if(_input_is_setmonitor_vm_to_skip(dpy, res, orig, orig_count, atom_name)) {
 				/* Skip this setmonitor VM — we'll replace with our splits */
 				XFree(atom_name);
 				continue;
@@ -1344,7 +1387,7 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 		 * which inputs they discard, otherwise total_monitors and the
 		 * actual emit count desync and Cinnamon's JS layer crashes. */
 		if(any_splits_will_emit && !orig[i].automatic && strchr(atom_name, '~')) {
-			if(_input_is_setmonitor_vm_to_skip(dpy, res, atom_name)) {
+			if(_input_is_setmonitor_vm_to_skip(dpy, res, orig, orig_count, atom_name)) {
 				XFree(atom_name);
 				continue;
 			}
