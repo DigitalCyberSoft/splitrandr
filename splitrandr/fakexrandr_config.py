@@ -8,6 +8,7 @@
 """Writes fakexrandr binary configuration and manages Cinnamon restart."""
 
 import os
+import re
 import struct
 import subprocess
 import logging
@@ -484,7 +485,96 @@ def _parse_edid_monitorspec(edid_hex):
         elif tag == 0xFF and text:
             serial = text
 
+    # Muffin falls back to the binary product/serial codes when the text
+    # descriptors are absent (meta_output_parse_edid, muffin 6.6
+    # meta-monitor-manager.c: "0x%04x" % product_code, "0x%08x" %
+    # serial_number; edid-parse.c reads both little-endian). The strings
+    # in cinnamon-monitors.xml must be byte-identical to muffin's or the
+    # stored configuration never matches, so replicate the fallbacks.
+    if product == "unknown":
+        try:
+            product = "0x%04x" % ((int(edid_hex[22:24], 16) << 8)
+                                  | int(edid_hex[20:22], 16))
+        except ValueError:
+            pass
+    if serial == "unknown":
+        try:
+            serial = "0x%08x" % ((int(edid_hex[30:32], 16) << 24)
+                                 | (int(edid_hex[28:30], 16) << 16)
+                                 | (int(edid_hex[26:28], 16) << 8)
+                                 | int(edid_hex[24:26], 16))
+        except ValueError:
+            pass
+
     return (vendor, product, serial)
+
+
+def _precise_mode_rates():
+    """Parse ``xrandr --verbose`` mode timings into
+    ``{output_name: [(width, height, rate), ...]}``.
+
+    ``rate`` is dotClock / (hTotal * vTotal) — the exact value muffin
+    computes for every mode (muffin 6.6 meta-gpu-xrandr.c) and compares
+    against a stored monitors.xml ``<rate>`` with a 0.001 tolerance
+    (MAXIMUM_REFRESH_RATE_DIFF, meta-monitor.c). The 2-decimal rates
+    xrandr prints (59.97 for a true 59.9685) miss that tolerance, which
+    silently discards the whole stored configuration at Cinnamon
+    startup and triggers the enable-everything linear fallback.
+    """
+    env = os.environ.copy()
+    env.pop('LD_PRELOAD', None)  # xrandr must never load our .so
+    try:
+        out = subprocess.run(
+            ['xrandr', '--verbose'], env=env,
+            capture_output=True, text=True, timeout=15
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("xrandr --verbose failed, no precise rates: %s", e)
+        return {}
+
+    rates = {}
+    modes = None
+    mhz = width = h_total = None
+    for line in out.splitlines():
+        m = re.match(r'(\S+) (?:dis)?connected', line)
+        if m:
+            modes = rates.setdefault(m.group(1), [])
+            mhz = None
+            continue
+        if modes is None:
+            continue
+        m = re.match(r'\s+\d+x\d+i?\s+\(0x[0-9a-f]+\)\s+([\d.]+)MHz', line)
+        if m:
+            mhz = float(m.group(1))
+            continue
+        m = re.match(r'\s+h:\s+width\s+(\d+).*\btotal\s+(\d+)', line)
+        if m and mhz is not None:
+            width, h_total = int(m.group(1)), int(m.group(2))
+            continue
+        m = re.match(r'\s+v:\s+height\s+(\d+).*\btotal\s+(\d+)', line)
+        if m and mhz is not None and h_total:
+            height, v_total = int(m.group(1)), int(m.group(2))
+            if v_total:
+                modes.append(
+                    (width, height, mhz * 1e6 / (h_total * v_total)))
+            mhz = None
+    return rates
+
+
+def _precise_rate_for(rates, output_name, output_cfg):
+    """Best precise rate for an output's configured mode, falling back
+    to the stored 2-decimal rate when the mode can't be found."""
+    fallback = output_cfg.mode.refresh_rate or 60.0
+    candidates = [r for (w, h, r) in rates.get(output_name, ())
+                  if w == output_cfg.size[0] and h == output_cfg.size[1]]
+    if not candidates:
+        return fallback
+    if output_cfg.mode.refresh_rate is None:
+        return candidates[0]
+    best = min(candidates, key=lambda r: abs(r - fallback))
+    # 2-decimal rounding error is at most 0.005; anything further off
+    # is a different mode with the same geometry.
+    return best if abs(best - fallback) < 0.01 else fallback
 
 
 def _ensure_one_primary(config_elem):
@@ -514,49 +604,47 @@ def _ensure_one_primary(config_elem):
 
 
 def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
-    """Write ~/.config/cinnamon-monitors.xml with one configuration block
-    that lists ONLY the parent (real) outputs.
+    """Write ~/.config/cinnamon-monitors.xml describing the monitor set
+    muffin will actually see at its next startup.
 
-    History: earlier versions emitted two ``<configuration>`` blocks —
-    a "split" block listing 1-indexed fake-output connectors
-    (``HDMI-0~1..3``, ``DP-5~1..3``), and an "unsplit" block listing
-    parent outputs (``HDMI-0``, ``DP-5``). On Nvidia tile hardware
-    where ``xrandr --setmonitor`` registers RandR 1.5 monitors with
-    0-indexed names (``HDMI-0~0..2``, ``DP-5~0..2``), the 1-indexed
-    fake names did NOT match Mutter's MetaMonitor list, so Mutter
-    applied the split block but produced no MetaMonitor with
-    ``is_primary=true``. Cinnamon JS startup then dereferenced
-    ``layoutManager.primaryMonitor`` (which becomes ``undefined`` when
-    ``global.display.get_primary_monitor()`` returns -1) and
-    ``main.js`` threw a TypeError, killing the WM before paint.
-    Observed 2026-04-29 sessions 109 and 145.
+    Muffin only applies a stored ``<configuration>`` when its monitor
+    specs are an EXACT match for the connected monitor set: same
+    connector/vendor/product/serial strings for every monitor
+    (including disabled ones, via ``<disabled>``), and a ``<mode>``
+    whose width/height match exactly with rate within 0.001
+    (meta_monitor_mode_spec_equals, muffin 6.6 meta-monitor.c). On any
+    mismatch it silently generates a linear fallback config that
+    ENABLES EVERY connected output — which is what kept re-enabling a
+    deliberately-disabled internal panel on every Cinnamon restart.
 
-    The split-block names couldn't simply be switched to 0-indexed
-    either, because the split layout's logical-monitor positions
-    overlap each other inside a single parent (the splits are
-    sub-regions, not independent panels), and Mutter rejects
-    overlapping positioned outputs as an invalid configuration.
+    Two consequences drive the shape of this writer:
 
-    Resolution: emit only the parent-output configuration. Window
-    snapping and applet placement on the actual splits are still
-    handled by:
-      - ``xrandr --setmonitor`` (X-server-level RandR 1.5 monitors,
-        visible to apps that query ``XRRGetMonitors``);
-      - ``libXrandr.so.2`` synthesised fake outputs (visible to apps
-        that query ``XRRGetScreenResources``);
-      - the ``primary_connector_name`` field in fakexrandr.bin which
-        flips ``XRRMonitorInfo.primary`` for the chosen tile.
+    - With splits active, Cinnamon runs under the LD_PRELOAD shim, so
+      muffin's monitor set is the SYNTHESIZED one: leaf 0 folded into
+      the parent connector name (``HDMI-A-0``), later leaves as
+      ``HDMI-A-0~1``..; all leaves expose no EDID, so their specs are
+      the literal string "unknown" three times (meta_output_parse_edid
+      fallback). A parent-only configuration can never match that set.
+    - Rates must be computed the way muffin computes them —
+      dotClock / (hTotal * vTotal), see _precise_mode_rates() — not the
+      2-decimal values xrandr prints.
 
-    cinnamon-monitors.xml only needs to keep Mutter's MetaMonitor
-    layout sane at startup so the WM survives long enough for the
-    other layers to take effect.
+    History: the first version emitted a "split" block with 1-INDEXED
+    fake connectors (``HDMI-0~1..3``); those names matched nothing in
+    Mutter's MetaMonitor list, no MetaMonitor got ``is_primary=true``,
+    and Cinnamon JS died on ``layoutManager.primaryMonitor`` being
+    undefined (2026-04-29, sessions 109 and 145). The replacement
+    emitted only parent outputs — which never matched under the shim
+    either, so every startup silently took the linear fallback. That
+    fallback happened to reproduce a look-alike layout while all
+    outputs were meant to be enabled, hiding the mismatch until a
+    profile needed an output OFF (2026-07-07). The leaf entries
+    written here are 0-indexed with leaf 0 folded to the parent name,
+    matching both ``xrandr --setmonitor`` registration and the shim's
+    synthesis, and their positions tile without overlap, so neither
+    old failure mode applies.
     """
-    # Always write monitors.xml with parent-output entries.  The
-    # cinnamon LD_PRELOAD restart path was removed 2026-04-29 (see
-    # xrandr_save.py for the rationale); without that restart,
-    # libXrandr.so.2's fake outputs never reach Cinnamon, so
-    # monitors.xml referring to parent connectors is exactly what
-    # Mutter expects.
+    rates = _precise_mode_rates()
     root = ET.Element('monitors', version='2')
     cfg = ET.SubElement(root, 'configuration')
 
@@ -564,16 +652,39 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, border
         if not output_cfg.active:
             continue
         output_state = xrandr_state.outputs.get(output_name)
-        edid = output_state.edid_hex if output_state else ""
-        vendor, product, serial = _parse_edid_monitorspec(edid)
-        rate = output_cfg.mode.refresh_rate if output_cfg.mode.refresh_rate else 60.0
-        _add_logicalmonitor(
-            cfg, output_name,
-            vendor, product, serial,
-            output_cfg.position[0], output_cfg.position[1],
-            output_cfg.size[0], output_cfg.size[1], rate,
-            primary=output_cfg.primary, scale=1
-        )
+        rate = _precise_rate_for(rates, output_name, output_cfg)
+        tree = (splits_dict or {}).get(output_name)
+        if tree is not None and not tree.is_leaf:
+            # Split output: muffin sees one synthesized monitor per
+            # leaf, without EDID ("unknown" specs). Leaf mode timings
+            # are copied from the parent's current mode (libXrandr.c
+            # fake-mode synthesis), so every leaf inherits the
+            # parent's precise rate.
+            primary_idx = tree.primary_leaf_index()
+            if primary_idx is None and output_cfg.primary:
+                primary_idx = 0
+            base_x, base_y = output_cfg.position
+            regions = tree.leaf_regions(
+                output_cfg.size[0], output_cfg.size[1])
+            for i, (lx, ly, lw, lh, _w_mm, _h_mm) in enumerate(regions):
+                connector = (output_name if i == 0
+                             else '%s~%d' % (output_name, i))
+                _add_logicalmonitor(
+                    cfg, connector,
+                    'unknown', 'unknown', 'unknown',
+                    base_x + lx, base_y + ly, lw, lh, rate,
+                    primary=(i == primary_idx), scale=1
+                )
+        else:
+            edid = output_state.edid_hex if output_state else ""
+            vendor, product, serial = _parse_edid_monitorspec(edid)
+            _add_logicalmonitor(
+                cfg, output_name,
+                vendor, product, serial,
+                output_cfg.position[0], output_cfg.position[1],
+                output_cfg.size[0], output_cfg.size[1], rate,
+                primary=output_cfg.primary, scale=1
+            )
 
     count = _ensure_one_primary(cfg)
 
@@ -585,6 +696,29 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, border
         )
         return
 
+    # Connected-but-disabled outputs must be listed in <disabled> —
+    # muffin's stored-config key covers the WHOLE connected set, so a
+    # connected monitor that appears nowhere in the configuration
+    # makes it unmatchable and re-enables everything via the fallback.
+    disabled_elem = None
+    disabled_count = 0
+    for output_name, output_cfg in xrandr_config.outputs.items():
+        if output_cfg.active:
+            continue
+        output_state = xrandr_state.outputs.get(output_name)
+        if not (output_state and output_state.connected):
+            continue
+        vendor, product, serial = _parse_edid_monitorspec(
+            output_state.edid_hex)
+        if disabled_elem is None:
+            disabled_elem = ET.SubElement(cfg, 'disabled')
+        spec = ET.SubElement(disabled_elem, 'monitorspec')
+        ET.SubElement(spec, 'connector').text = output_name
+        ET.SubElement(spec, 'vendor').text = vendor
+        ET.SubElement(spec, 'product').text = product
+        ET.SubElement(spec, 'serial').text = serial
+        disabled_count += 1
+
     _indent_xml(root)
     tree_obj = ET.ElementTree(root)
     xml_path = compositor.current().monitors_xml_path
@@ -593,7 +727,8 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, border
     tmp_path = xml_path + '.tmp'
     tree_obj.write(tmp_path, encoding='unicode', xml_declaration=False)
     os.replace(tmp_path, xml_path)
-    log.info("wrote %s (parent outputs=%d)", xml_path, count)
+    log.info("wrote %s (logical monitors=%d, disabled=%d)",
+             xml_path, count, disabled_count)
 
 
 def _add_logicalmonitor(parent, connector, vendor, product, serial,
