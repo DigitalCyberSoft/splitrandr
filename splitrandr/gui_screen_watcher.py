@@ -121,7 +121,64 @@ class ScreenWatcher:
 
     def _on_monitors_changed(self, screen):
         _sw_log.info("display configuration changed (hotplug/power event)")
+        # Drop the fakexrandr split VMs immediately. Otherwise Muffin
+        # processes the incoming RandR hotplug with NAME~0..n still
+        # registered, and the half-valid split set desyncs its
+        # logical-monitor list: meta_monitor_manager_get_logical_monitor_
+        # from_number asserts (index >= list length) and Cinnamon's JS
+        # shell throws "monitor is undefined", wedging the session. The
+        # debounced re-apply below re-establishes the split once the
+        # monitor set stops flapping.
+        self._teardown_splits_now()
         self._schedule_reapply()
+
+    def _teardown_splits_now(self):
+        """Delete the fakexrandr setmonitor VMs right now, so a monitor
+        hotplug/power event reaches Muffin as the plain physical outputs
+        instead of the split view.
+
+        Muffin wedges on the split only during an *uncontrolled* RandR
+        event -- a hardware disconnect it processes while NAME~0..n are
+        registered. splitrandr's own setmonitor/delmonitor calls are
+        already made safe by CinnamonSetMonitorGuard (muffin#532), so we
+        reuse that guard here: enumerate the live VMs from the real
+        (un-shimmed) xrandr and drop them with Cinnamon frozen.
+        """
+        import subprocess
+        env = dict(os.environ)
+        env.pop('LD_PRELOAD', None)  # bypass the shim -> see the real VMs
+        try:
+            out = subprocess.run(
+                ['xrandr', '--listmonitors'],
+                capture_output=True, text=True, timeout=5, env=env,
+            ).stdout
+        except Exception as e:
+            _sw_log.warning("teardown: --listmonitors failed: %s", e)
+            return
+        vms = []
+        for line in out.splitlines():
+            # rows: " 0: HDMI-0~0 2496/786x648/204+3840+0  HDMI-0"
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].rstrip(':').isdigit():
+                continue
+            name = parts[1].lstrip('+*')
+            if '~' in name:
+                vms.append(name)
+        if not vms:
+            _sw_log.info("teardown: no split VMs registered, nothing to drop")
+            return
+        _sw_log.info("teardown: dropping %d split VM(s) on hotplug: %s",
+                     len(vms), ", ".join(vms))
+        try:
+            from .cinnamon_compat import CinnamonSetMonitorGuard
+            with CinnamonSetMonitorGuard():
+                for name in vms:
+                    subprocess.run(
+                        ['xrandr', '--delmonitor', name],
+                        capture_output=True, timeout=5, env=env,
+                    )
+        except Exception as e:
+            _sw_log.warning("teardown: delmonitor failed: %s", e)
 
     def _on_signal(self, conn, sender, path, iface, signal, params):
         if signal == 'ActiveChanged':
