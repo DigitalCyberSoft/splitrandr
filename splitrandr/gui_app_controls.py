@@ -59,6 +59,10 @@ class ApplicationControlsMixin:
         self._update_controls_for_selection()
 
     def _update_controls_for_selection(self):
+        # The per-monitor split buttons under the canvas don't depend on
+        # selection — keep them in sync with the active outputs here,
+        # where every layout change already funnels through.
+        self._rebuild_split_buttons()
         self._updating_controls = True
         try:
             name = self.widget.selected_output
@@ -88,8 +92,6 @@ class ApplicationControlsMixin:
                 self._res_combo.set_sensitive(False)
                 self._rate_combo.set_sensitive(False)
                 self._rot_combo.set_sensitive(False)
-                self._split_btn.set_sensitive(False)
-                self._remove_splits_btn.set_sensitive(False)
                 self._border_label.set_sensitive(False)
                 self._border_spin.set_sensitive(False)
                 self._border_px_label.set_sensitive(False)
@@ -163,10 +165,8 @@ class ApplicationControlsMixin:
             if current_rot_idx >= 0:
                 self._rot_combo.set_active(current_rot_idx)
 
-            # Split buttons
-            self._split_btn.set_sensitive(True)
-            has_splits = phys_name in xrandr.configuration.splits
-            self._remove_splits_btn.set_sensitive(has_splits)
+            # (Split actions are per-monitor buttons under the canvas,
+            # rebuilt by _rebuild_split_buttons; nothing to do here.)
 
             # Border spin — sensitive for any active output
             self._border_label.set_sensitive(True)
@@ -319,40 +319,6 @@ class ApplicationControlsMixin:
         self.widget.set_primary(phys, not currently,
                                 leaf_idx=None if currently else leaf_idx)
 
-    def _resolve_split_target(self):
-        """Resolve which physical output to operate on.
-
-        Picks, in order: the currently-selected output's physical
-        parent; the primary; then the first active monitor.  Returns
-        the physical connector name, or None if the configuration has
-        no active outputs.
-        """
-        name = self.widget.selected_output
-        if name:
-            phys, _ = self.widget.parse_virtual_name(name)
-            if phys in self.widget._xrandr.configuration.outputs:
-                return phys
-        cfg = self.widget._xrandr.configuration
-        for n, out in cfg.outputs.items():
-            if out.active and out.primary:
-                return n
-        for n, out in cfg.outputs.items():
-            if out.active:
-                return n
-        return None
-
-    def _on_split_clicked(self):
-        phys = self._resolve_split_target()
-        if not phys:
-            return
-        self.widget._on_split_monitor(None, phys)
-
-    def _on_remove_splits_clicked(self):
-        phys = self._resolve_split_target()
-        if not phys:
-            return
-        self.widget._on_remove_splits(None, phys)
-
     def _on_border_changed(self):
         if self._updating_controls:
             return
@@ -374,10 +340,3 @@ class ApplicationControlsMixin:
 
     def _on_reset_defaults(self):
         self.widget.load_from_x()
-
-    #################### zoom ####################
-
-    def _on_zoom_toggled(self, button, value):
-        if button.get_active():
-            self.widget.factor = value
-            self.current_widget.factor = value

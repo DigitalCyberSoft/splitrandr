@@ -364,15 +364,38 @@ class SplitEditorDialog(Gtk.Dialog):
             transient_for=parent,
             modal=True,
         )
-        self.add_buttons(
-            "Cancel", Gtk.ResponseType.CANCEL,
-            "OK", Gtk.ResponseType.OK,
-        )
+        # Open roughly centered on the main window. The hint alone is
+        # not enough: Muffin ignores program position hints for
+        # free-floating transients (attach-modal-dialogs off), so we
+        # also move() explicitly once mapped — post-map configure
+        # requests are honored (window_layout.py's wmctrl restores
+        # depend on the same behavior).
+        self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        self.connect('map-event', self._on_mapped_center)
+        # Cancel/OK are built into the single bottom button row below,
+        # not via add_buttons() — GtkDialog's action area put them on a
+        # separate lower tier, leaving OK detached in the bottom-right.
 
         self._output_name = output_name
         self._width = width
         self._height = height
         self._aspect_ratio = width / height if height else 16 / 9
+        # Size the preview canvas from the parent window, honoring the
+        # monitor's aspect ratio and leaving room for the fixed chrome
+        # (hint, presets, one button row) so the whole dialog stays
+        # inside the parent — the 300px class default was unusably small
+        # for dragging 5%-snapped lines. The instance attribute shadows
+        # the class constant, so _on_draw/_px_to_prop/_find_edge_at all
+        # follow automatically.
+        parent_w = parent.get_allocated_width() if parent else 0
+        parent_h = parent.get_allocated_height() if parent else 0
+        cw = self.CANVAS_WIDTH
+        if parent_w > 0 and parent_h > 0:
+            CHROME_H = 200  # hint + presets + button row + margins
+            max_w = min(parent_w * 0.55, 1200)
+            max_h = max(parent_h * 0.80 - CHROME_H, 200)
+            cw = min(max_w, max_h * self._aspect_ratio)
+        self.CANVAS_WIDTH = int(max(300, cw))
         self._canvas_height = int(self.CANVAS_WIDTH / self._aspect_ratio)
 
         if split_tree:
@@ -419,7 +442,7 @@ class SplitEditorDialog(Gtk.Dialog):
         # clicks are handled by the inner buttons, not the FlowBox.
         presets_box = Gtk.FlowBox()
         presets_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        presets_box.set_max_children_per_line(4)
+        presets_box.set_max_children_per_line(7)
         presets_box.set_min_children_per_line(1)
         presets_box.set_row_spacing(6)
         presets_box.set_column_spacing(6)
@@ -451,12 +474,16 @@ class SplitEditorDialog(Gtk.Dialog):
         frame.set_margin_bottom(12)
         content.pack_start(frame, False, False, 0)
 
-        # Undo + Reset buttons. Reset clears all splits back to a single
-        # leaf — equivalent to undoing every operation.
+        # One bottom row: Undo/Reset (left) and Cancel/OK (right).
+        # Reset clears all splits back to a single leaf. Cancel/OK drive
+        # the dialog response directly (self.response), so they sit in
+        # the same row instead of GtkDialog's separate action area.
         button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         button_row.set_margin_start(12)
         button_row.set_margin_end(12)
+        button_row.set_margin_top(6)
         button_row.set_margin_bottom(12)
+
         self._undo_button = Gtk.Button(label="Undo")
         self._undo_button.set_sensitive(False)
         self._undo_button.connect("clicked", lambda b: self._undo())
@@ -464,7 +491,21 @@ class SplitEditorDialog(Gtk.Dialog):
         reset_button = Gtk.Button(label="Reset (no splits)")
         reset_button.connect("clicked", lambda b: self._reset_tree())
         button_row.pack_start(reset_button, False, False, 0)
+
+        ok_button = Gtk.Button(label="OK")
+        ok_button.get_style_context().add_class('suggested-action')
+        ok_button.connect(
+            "clicked", lambda b: self.response(Gtk.ResponseType.OK))
+        button_row.pack_end(ok_button, False, False, 0)
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect(
+            "clicked", lambda b: self.response(Gtk.ResponseType.CANCEL))
+        button_row.pack_end(cancel_button, False, False, 0)
+        # Enter activates OK; Escape/close return non-OK, which the
+        # caller already treats as cancel.
+        ok_button.set_can_default(True)
         content.pack_start(button_row, False, False, 0)
+        self.set_default(ok_button)
 
         # Ctrl+Z keyboard accelerator
         accel = Gtk.AccelGroup()
@@ -475,6 +516,33 @@ class SplitEditorDialog(Gtk.Dialog):
         )
 
         content.show_all()
+
+    def _on_mapped_center(self, _widget, _event):
+        """Center on the parent window, clamped to the parent's monitor
+        so no part of the dialog (notably the OK button) lands off the
+        visible screen."""
+        parent = self.get_transient_for()
+        if parent is None:
+            return False
+        px, py = parent.get_position()
+        pw = parent.get_allocated_width()
+        ph = parent.get_allocated_height()
+        dw, dh = self.get_size()
+        x = px + (pw - dw) // 2
+        y = py + (ph - dh) // 2
+
+        # Clamp to the work area of the monitor the parent sits on.
+        try:
+            display = self.get_display()
+            monitor = display.get_monitor_at_window(parent.get_window())
+            geo = monitor.get_workarea()
+            x = max(geo.x, min(x, geo.x + geo.width - dw))
+            y = max(geo.y, min(y, geo.y + geo.height - dh))
+        except Exception:
+            x = max(x, 0)
+            y = max(y, 0)
+        self.move(x, y)
+        return False
 
     def _push_undo(self):
         """Snapshot the current tree before a mutating operation."""

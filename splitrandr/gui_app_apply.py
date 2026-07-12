@@ -101,6 +101,18 @@ log = logging.getLogger('splitrandr')
 
 class ApplicationApplyMixin:
 
+    def _reload_cinnamon_ui(self):
+        """Reload Cinnamon from a UI action (hamburger / InfoBar), with
+        the status InfoBar suppressed for the duration so the transient
+        not-loaded window doesn't flash the bar."""
+        self._reload_in_flight = True
+        try:
+            self._on_reload_cinnamon()
+        finally:
+            self._reload_in_flight = False
+            self._fxr_bad_streak = 0
+            self._refresh_fxr_status()
+
     def _on_reload_cinnamon(self):
         """Force-restart Cinnamon with fakexrandr LD_PRELOAD and verify."""
         from .fakexrandr_config import (
@@ -277,6 +289,17 @@ class ApplicationApplyMixin:
         return True
 
     def do_apply(self):
+        # Flag the pipeline so the status InfoBar ignores the transient
+        # stale/not-loaded states our own Cinnamon restart produces.
+        self._apply_in_flight = True
+        try:
+            self._do_apply_inner()
+        finally:
+            self._apply_in_flight = False
+            self._fxr_bad_streak = 0
+            self._refresh_fxr_status()
+
+    def _do_apply_inner(self):
         if self.widget.abort_if_unsafe():
             return
 
@@ -387,6 +410,15 @@ class ApplicationApplyMixin:
                     log.warning("failed to restore profile after revert: %s", e)
 
     def do_apply_autostart(self):
+        self._apply_in_flight = True
+        try:
+            self._do_apply_autostart_inner()
+        finally:
+            self._apply_in_flight = False
+            self._fxr_bad_streak = 0
+            self._refresh_fxr_status()
+
+    def _do_apply_autostart_inner(self):
         if self.widget.abort_if_unsafe():
             return
 

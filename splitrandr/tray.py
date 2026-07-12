@@ -123,16 +123,17 @@ class SplitRandRTray:
         active = profiles.get_active_profile()
         names = profiles.list_profiles()
 
-        group = []
+        # CheckMenuItem drawn as radio; exclusivity is enforced by the
+        # rebuild in _on_profile_toggled, not by a widget group.
+        # (Gtk.CheckMenuItem has no join_group — that's RadioMenuItem
+        # API — so the old group code raised AttributeError the moment
+        # a second profile existed.)
         for name in names:
             item = Gtk.CheckMenuItem(label=name)
             item.set_draw_as_radio(True)
             if name == active:
                 item.set_active(True)
             item.connect('toggled', self._on_profile_toggled, name)
-            if group:
-                item.join_group(group[0])
-            group.append(item)
             menu.append(item)
 
         if names:

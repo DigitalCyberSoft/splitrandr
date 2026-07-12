@@ -8,6 +8,8 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
 
+import math
+
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('PangoCairo', '1.0')
@@ -21,49 +23,47 @@ from .splits import SplitTree, SplitEditorDialog, SPLIT_COLORS
 from .cinnamon_compat import query_cinnamon_monitors
 from .i18n import _
 
-# CSS for themed monitor rendering
-_CSS = b"""
-.splitrandr-monitor {
-    background-color: @theme_bg_color;
-    border: 2px solid @borders;
-    border-radius: 6px;
-    color: @theme_fg_color;
-}
-.splitrandr-monitor:hover {
-    background-color: @theme_selected_bg_color;
-}
-"""
-_css_provider = Gtk.CssProvider()
-try:
-    _css_provider.load_from_data(_CSS)
-    Gtk.StyleContext.add_provider_for_screen(
-        Gdk.Screen.get_default(),
-        _css_provider,
-        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-    )
-except Exception:
-    pass
-
 
 def _get_theme_colors():
-    """Get colors from the current GTK theme."""
-    ctx = Gtk.StyleContext()
-    ctx.add_class('splitrandr-monitor')
+    """Derive the canvas palette from the loaded GTK theme, with the
+    previous hardcoded values as fallbacks for themes that don't define
+    the named colors."""
+    ctx = Gtk.Button().get_style_context()
 
-    # Create a temporary widget to get a valid style context
-    w = Gtk.Button()
-    ctx = w.get_style_context()
-    ctx.add_class('splitrandr-monitor')
+    def lookup(name, fallback):
+        found, color = ctx.lookup_color(name)
+        if found:
+            return (color.red, color.green, color.blue, color.alpha)
+        return fallback
 
-    fg = ctx.get_color(Gtk.StateFlags.NORMAL)
+    def shade(color, k):
+        return (min(color[0] * k, 1.0), min(color[1] * k, 1.0),
+                min(color[2] * k, 1.0), color[3])
 
-    # Use hardcoded dark-theme-friendly defaults since
-    # get_background_color/get_border_color are deprecated in GTK 3.
+    fg_rgba = ctx.get_color(Gtk.StateFlags.NORMAL)
+    fg = (fg_rgba.red, fg_rgba.green, fg_rgba.blue, fg_rgba.alpha)
+    bg = lookup('theme_bg_color', (0.25, 0.25, 0.25, 1.0))
+    base = lookup('theme_base_color', (0.2, 0.2, 0.2, 1.0))
+    accent = lookup('theme_selected_bg_color', (0.2, 0.5, 0.9, 1.0))
+    borders = lookup('borders', (0.5, 0.5, 0.5, 1.0))
+    is_dark = (bg[0] + bg[1] + bg[2]) / 3 < 0.5
+
     return {
-        'bg': (0.25, 0.25, 0.25, 0.85),
-        'fg': (fg.red, fg.green, fg.blue, fg.alpha),
-        'bg_hover': (0.35, 0.35, 0.35, 0.85),
-        'border': (0.5, 0.5, 0.5, 1.0),
+        # Widget background behind everything.
+        'canvas_bg': shade(bg, 0.8 if is_dark else 0.93),
+        # The virtual-screen bounding box the monitors sit on.
+        'workarea': shade(bg, 1.1 if is_dark else 0.97),
+        # Monitor tile fill (under the screenshot, and the fallback
+        # when no screenshot is available).
+        'bg': base[:3] + (0.95,),
+        'bg_hover': shade(base, 1.3 if is_dark else 0.95)[:3] + (0.95,),
+        'fg': fg,
+        'border': borders,
+        'accent': accent,
+        # Name pill: dark-on-light-text regardless of theme so it stays
+        # readable over arbitrary screenshot content.
+        'pill_bg': (0.0, 0.0, 0.0, 0.6),
+        'pill_fg': (1.0, 1.0, 1.0, 0.95),
     }
 
 
@@ -177,6 +177,15 @@ class MonitorWidget(Gtk.DrawingArea):
 
         self.window = window
         self._factor = factor
+        # Fit modes (mutually exclusive, both optional). _fit_size
+        # scales the canvas to fill an allocated (w, h) slot — used by
+        # the editable Proposed pane; _fit_height scales to a target
+        # pixel height — used by the read-only thumbnail panes. The
+        # factor stays an integer: drag-and-drop position math
+        # multiplies event deltas by it, and a fractional factor would
+        # leak fractional positions into the configuration.
+        self._fit_size = None
+        self._fit_height = None
         self._readonly = readonly
         # When False, render the underlying physical layout — ignore
         # cfg.splits and cfg.borders. Used by the "Real (no virtual)"
@@ -269,16 +278,55 @@ class MonitorWidget(Gtk.DrawingArea):
                 'border': cfg.borders.get(name, 0) if self._show_splits else 0,
             })
 
-    def _update_size_request(self):
-        if not self._monitors:
-            self.set_size_request(128, 128)
-            return
+    def _content_extent(self):
+        """Virtual-pixel size of the drawn content, with a 5% margin."""
         max_x = max(m['x'] + m['w'] for m in self._monitors)
         max_y = max(m['y'] + m['h'] for m in self._monitors)
-        # 10% margin
-        cw = int(max_x * 1.1)
-        ch = int(max_y * 1.1)
-        self.set_size_request(cw // self.factor, ch // self.factor)
+        return int(max_x * 1.05), int(max_y * 1.05)
+
+    def _update_size_request(self):
+        if not self._monitors:
+            self.set_size_request(128, 96)
+            return
+        cw, ch = self._content_extent()
+        if self._fit_size:
+            avail_w, avail_h = self._fit_size
+            if avail_w > 1 and avail_h > 1:
+                self._factor = max(
+                    1, math.ceil(max(cw / avail_w, ch / avail_h)))
+        elif self._fit_height:
+            self._factor = max(1, math.ceil(ch / self._fit_height))
+        self.set_size_request(int(cw / self.factor), int(ch / self.factor))
+
+    def set_fit_size(self, width, height):
+        """Fit the canvas into a (width, height) pixel slot; called by
+        the layout on slot size-allocate."""
+        if self._fit_size == (width, height):
+            return
+        self._fit_size = (width, height)
+        self._update_size_request()
+        self._force_repaint()
+
+    def set_fit_height(self, height):
+        """Scale the canvas to a target pixel height (thumbnail mode)."""
+        if self._fit_height == height:
+            return
+        self._fit_height = height
+        self._update_size_request()
+        self._force_repaint()
+
+    def select_default_output(self):
+        """Select the primary (else first) active output. Sets the
+        private field directly: the property setter would flash the
+        on-screen identify overlay, which is unwanted at startup."""
+        if self._selected_output or not self._monitors:
+            return
+        target = next(
+            (m['name'] for m in self._monitors if m['primary']),
+            self._monitors[0]['name'])
+        self._selected_output = target
+        self._force_repaint()
+        self.emit('selection-changed')
 
     #################### screenshots ####################
 
@@ -636,9 +684,9 @@ class MonitorWidget(Gtk.DrawingArea):
     #################### painting ####################
 
     def do_expose_event(self, _event, context):
-        # Black background fills entire allocation
+        # Theme background fills the entire allocation
         alloc = self.get_allocation()
-        context.set_source_rgb(0, 0, 0)
+        context.set_source_rgba(*self._theme_colors['canvas_bg'])
         context.rectangle(0, 0, alloc.width, alloc.height)
         context.fill()
 
@@ -647,20 +695,31 @@ class MonitorWidget(Gtk.DrawingArea):
 
         context.save()
         context.scale(1 / self.factor, 1 / self.factor)
-        context.set_line_width(self.factor * 1.5)
         self._draw_monitors(context)
         context.restore()
 
     def _draw_monitors(self, context):
         """Unified draw method for all monitors in _monitors list."""
-        # Gray bounding box background
+        # NOTE: the context is scaled by 1/factor, so all coordinates
+        # here are virtual pixels. On-screen line widths, dashes and
+        # badge sizes must therefore be multiplied by self.factor.
+        fac = self.factor
+
+        # Virtual-screen bounding box the monitors sit on
         max_x = max(m['x'] + m['w'] for m in self._monitors)
         max_y = max(m['y'] + m['h'] for m in self._monitors)
-        context.set_source_rgb(0.5, 0.5, 0.5)
-        context.rectangle(0, 0, max_x, max_y)
+        colors = self._theme_colors
+        _rounded_rect(context, 0, 0, max_x, max_y, 6 * fac)
+        context.set_source_rgba(*colors['workarea'])
         context.fill()
 
-        colors = self._theme_colors
+        # One uniform label font size for the whole pane, scaled to the
+        # widget (larger on the big editable pane, smaller on the
+        # thumbnails) and converted to virtual px via fac. Per-tile
+        # sizing produced wildly different pills (a big tile got a giant
+        # label, a narrow one a tiny one) that overflowed their tiles.
+        alloc_h = self.get_allocated_height()
+        label_font_px = max(11, min(alloc_h * 0.05, 22)) * fac
 
         for mon in self._monitors:
             name = mon['name']
@@ -669,8 +728,8 @@ class MonitorWidget(Gtk.DrawingArea):
 
             is_hover = (not self._readonly and name == self._hover_output)
             is_selected = (name == self._selected_output)
-            radius = min(rect[2], rect[3]) * 0.02
-            radius = max(4, min(radius, 12))
+            # ~6px on-screen corner radius, capped for tiny tiles
+            radius = min(6 * fac, min(rect[2], rect[3]) * 0.1)
 
             # Fill
             bg = colors['bg_hover'] if is_hover else colors['bg']
@@ -678,7 +737,9 @@ class MonitorWidget(Gtk.DrawingArea):
             context.set_source_rgba(*bg)
             context.fill()
 
-            # Screenshot thumbnail
+            # Screenshot thumbnail — near-opaque: on hardware without
+            # usable EDID names the content is the primary
+            # which-monitor-is-which signal.
             if name in self._screenshots:
                 pb = self._screenshots[name]
                 context.save()
@@ -689,17 +750,24 @@ class MonitorWidget(Gtk.DrawingArea):
                 context.translate(rect[0], rect[1])
                 context.scale(sx, sy)
                 Gdk.cairo_set_source_pixbuf(context, pb, 0, 0)
-                context.paint_with_alpha(0.45)
+                context.paint_with_alpha(0.8)
                 context.restore()
+                if is_hover:
+                    _rounded_rect(context, rect[0], rect[1],
+                                  rect[2], rect[3], radius)
+                    context.set_source_rgba(1, 1, 1, 0.08)
+                    context.fill()
 
-            # Border stroke
+            # Border stroke: accent ring when selected, hairline otherwise.
+            # Read-only panes (thumbnails) get a thinner mirror-selection
+            # ring so it reads as a hint, not a frame.
             _rounded_rect(context, rect[0], rect[1], rect[2], rect[3], radius)
             if is_selected:
-                context.set_source_rgba(0.2, 0.5, 0.9, 0.9)
-                context.set_line_width(4)
+                context.set_source_rgba(*colors['accent'])
+                context.set_line_width((1 if self._readonly else 2) * fac)
             else:
                 context.set_source_rgba(*colors['border'])
-                context.set_line_width(2)
+                context.set_line_width(1 * fac)
             context.stroke()
 
             # Split overlay
@@ -731,64 +799,70 @@ class MonitorWidget(Gtk.DrawingArea):
                 context.rectangle(px, py, pw, ph)
                 context.fill()
                 context.set_source_rgba(0.4, 0.7, 0.4, 0.5)
-                context.set_line_width(1)
-                context.set_dash([4, 3])
+                context.set_line_width(1 * fac)
+                context.set_dash([4 * fac, 3 * fac])
                 context.rectangle(px, py, pw, ph)
                 context.stroke()
                 context.set_dash([])
 
-            # Name label
+            # Name pill — uniform font, ellipsized to fit the tile so it
+            # never spills past the edges into neighbouring tiles.
             context.save()
 
             rotation = mon['rotation']
             is_odd_rotation = rotation and rotation.is_odd
-            textwidth = rect[3] if is_odd_rotation else rect[2]
-            widthperchar = textwidth / max(len(name), 1)
-            textheight = int(widthperchar * 0.8)
-            textheight = max(40, min(textheight, 200))
+            along = rect[3] if is_odd_rotation else rect[2]  # text baseline runs here
+            textheight = label_font_px
 
             newdescr = Pango.FontDescription("sans bold")
-            newdescr.set_size(textheight * Pango.SCALE)
+            newdescr.set_absolute_size(textheight * Pango.SCALE)
 
             name_markup = GLib.markup_escape_text(name)
-            layout = PangoCairo.create_layout(context)
-            layout.set_font_description(newdescr)
             if mon['primary']:
                 name_markup = "<u>%s</u>" % name_markup
+            layout = PangoCairo.create_layout(context)
+            layout.set_font_description(newdescr)
             layout.set_markup(name_markup, -1)
 
-            layoutsize = layout.get_pixel_size()
+            pad_x = textheight * 0.5
+            pad_y = textheight * 0.28
+            # Available text width inside the tile, leaving a margin so
+            # the pill has breathing room from the tile border.
+            max_text_w = max(along - 4 * pad_x, textheight)
+            nat_w, nat_h = layout.get_pixel_size()
+            if nat_w > max_text_w:
+                layout.set_ellipsize(Pango.EllipsizeMode.END)
+                layout.set_width(int(max_text_w * Pango.SCALE))
+                draw_w = max_text_w
+            else:
+                draw_w = nat_w
 
-            # Compute text position at center, handling rotation
-            context.move_to(*center)
+            # Pill centered on the tile, handling rotation
+            context.translate(*center)
             if rotation:
                 context.rotate(rotation.angle)
-            text_x = -layoutsize[0] / 2
-            text_y = -layoutsize[1] / 2
 
-            # Dark backdrop behind text
-            pad = textheight * 0.3
-            context.rel_move_to(text_x - pad, text_y - pad)
-            context.rel_line_to(layoutsize[0] + 2 * pad, 0)
-            context.rel_line_to(0, layoutsize[1] + 2 * pad)
-            context.rel_line_to(-(layoutsize[0] + 2 * pad), 0)
-            context.close_path()
-            context.set_source_rgba(0, 0, 0, 0.55)
+            pill_w = draw_w + 2 * pad_x
+            pill_h = nat_h + 2 * pad_y
+            _rounded_rect(context, -pill_w / 2, -pill_h / 2,
+                          pill_w, pill_h, pill_h / 2)
+            context.set_source_rgba(*colors['pill_bg'])
             context.fill()
 
-            # White text
-            context.move_to(*center)
-            if rotation:
-                context.rotate(rotation.angle)
-            context.rel_move_to(text_x, text_y)
-            context.set_source_rgba(1, 1, 1, 0.95)
+            context.move_to(-draw_w / 2, -nat_h / 2)
+            context.set_source_rgba(*colors['pill_fg'])
             PangoCairo.show_layout(context, layout)
 
             context.restore()
 
     def _draw_split_overlay(self, context, tree, x, y, w, h, border=0,
                             selected_leaf_idx=None):
-        """Draw semi-transparent colored regions for each split sub-monitor."""
+        """Draw semi-transparent colored regions for each split sub-monitor.
+
+        Coordinates are virtual pixels (the context is scaled by
+        1/factor), so on-screen widths scale by self.factor."""
+        fac = self.factor
+        accent = self._theme_colors['accent']
         regions = list(tree.leaf_regions_proportional())
         leaves = [leaf for _, leaf in tree.iter_leaves()]
         # Compute border as proportion of monitor dimensions
@@ -810,35 +884,38 @@ class MonitorWidget(Gtk.DrawingArea):
             pw = rw * w
             ph = rh * h
 
-            context.set_source_rgba(*color, 0.3)
+            context.set_source_rgba(*color, 0.25)
             context.rectangle(px, py, pw, ph)
             context.fill()
 
             is_selected = (i == selected_leaf_idx)
             is_primary = (i < len(leaves) and leaves[i].primary)
 
-            # Border: thick blue if selected, normal dashed colored otherwise
+            # Border: accent ring if selected, dashed colored otherwise.
+            # Solid-while-dragging comes for free: the drag updates the
+            # node proportion and the dragged leaf is the selected one.
             if is_selected:
-                context.set_source_rgba(0.2, 0.5, 0.9, 0.95)
-                context.set_line_width(4)
+                context.set_source_rgba(*accent)
+                context.set_line_width(2 * fac)
                 context.rectangle(px, py, pw, ph)
                 context.stroke()
             else:
                 context.set_source_rgba(*color, 0.7)
-                context.set_line_width(2)
-                context.set_dash([6, 4])
+                context.set_line_width(1.2 * fac)
+                context.set_dash([5 * fac, 3 * fac])
                 context.rectangle(px, py, pw, ph)
                 context.stroke()
                 context.set_dash([])
 
-            # Primary marker: solid yellow corner badge
-            if is_primary and pw > 12 and ph > 12:
+            # Primary marker: solid yellow corner badge (~10px on screen)
+            badge = 10 * fac
+            if is_primary and pw > badge * 1.5 and ph > badge * 1.5:
                 context.set_source_rgba(1.0, 0.85, 0.0, 0.9)
-                context.rectangle(px + 4, py + 4, 10, 10)
+                context.rectangle(px + 5 * fac, py + 5 * fac, badge, badge)
                 context.fill()
                 context.set_source_rgba(0, 0, 0, 0.7)
-                context.set_line_width(1)
-                context.rectangle(px + 4, py + 4, 10, 10)
+                context.set_line_width(1 * fac)
+                context.rectangle(px + 5 * fac, py + 5 * fac, badge, badge)
                 context.stroke()
 
     def _force_repaint(self):

@@ -55,10 +55,19 @@ class Application(
 
     def __init__(self, randr_display=None, force_version=False):
         self.window = window = Gtk.Window()
-        window.props.title = _("Display")
+        window.props.title = _("SplitRandR")
+        window.set_icon_name('video-display')
         window.connect('delete-event', self._on_delete_event)
 
         self._updating_controls = False
+        # Which profile the Proposed pane reflects; None = live X state.
+        self._shown_profile = None
+        # Status-InfoBar suppression flags (see gui_app_layout).
+        self._apply_in_flight = False
+        self._reload_in_flight = False
+        self._fxr_bad_streak = 0
+
+        window.set_titlebar(self._build_headerbar())
 
         # Keyboard shortcuts
         accel = Gtk.AccelGroup()
@@ -73,6 +82,7 @@ class Application(
             display=randr_display, force_version=force_version,
             window=self.window, readonly=True
         )
+        self.current_widget.set_fit_height(150)
         self.current_widget.load_from_x()
 
         # Proposed (editable) widget
@@ -98,6 +108,7 @@ class Application(
             window=self.window, readonly=True, show_splits=False,
             share_xrandr_with=self.widget,
         )
+        self.original_widget.set_fit_height(150)
         self.original_widget._sync_monitors()
         self.original_widget._update_size_request()
         # Refresh whenever the editable widget changes so positions /
@@ -113,30 +124,29 @@ class Application(
         main_page = self._build_page()
         window.add(main_page)
 
-        # Request maximize BEFORE mapping so the WM honors it as
-        # part of the initial geometry — calling after show_all()
-        # races Muffin's map handler and is frequently ignored.
-        window.maximize()
+        # Size to the primary monitor's work area rather than a fixed
+        # geometry — on a 4K leaf this opens near-full-height; the old
+        # 1160x1000 stays as the floor for small work areas. With the
+        # fakexrandr shim loaded, Gdk monitors are the split leaves, so
+        # this sizes relative to the leaf the window will occupy.
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() if display else None
+        if monitor is None and display and display.get_n_monitors() > 0:
+            monitor = display.get_monitor(0)
+        if monitor:
+            wa = monitor.get_workarea()
+            window.set_default_size(
+                max(1160, int(wa.width * 0.72)),
+                max(1000, int(wa.height * 0.85)))
+        else:
+            window.set_default_size(1160, 1000)
         window.show_all()
 
         self._tray = None
 
-        # First-run dialog
-        if profiles.is_first_run():
-            dialog = Gtk.MessageDialog(
-                self.window, Gtk.DialogFlags.MODAL,
-                Gtk.MessageType.QUESTION, Gtk.ButtonsType.YES_NO,
-                _("Would you like SplitRandR to show a system tray icon "
-                  "for quick profile switching?"),
-            )
-            dialog.set_title(_("System Tray"))
-            response = dialog.run()
-            dialog.destroy()
-            tray_choice = 'true' if response == Gtk.ResponseType.YES else 'false'
-            profiles.set_setting('tray_enabled', tray_choice)
-
-        # Start tray if enabled
-        if profiles.get_setting('tray_enabled', 'false') == 'true':
+        # Start tray if enabled (default on: the resident process is
+        # what keeps wake/unlock re-apply alive).
+        if profiles.get_setting('tray_enabled', 'true') == 'true':
             self._start_tray()
 
         # Watch for screen unlock / wake to re-apply layout
@@ -150,11 +160,12 @@ class Application(
         import signal
         signal.signal(signal.SIGUSR1, lambda *a: GLib.idle_add(self._raise_window))
 
-        # Initial control state
+        # Initial control state. Auto-select the primary output so the
+        # controls area never starts as a dead zone; _shown_profile
+        # stays None because the pane holds live X state, not a profile.
+        self.widget.select_default_output()
         self._update_controls_for_selection()
-        self._populate_profiles_combo()
-        # No profile is active on fresh startup (we loaded from X, not a profile)
-        self._profile_combo.set_active(-1)
+        self._refresh_profile_ui()
 
         # Upgrade current widget to Cinnamon view after initial draw completes.
         # Done via idle_add so the DBUS call doesn't block the first paint.
