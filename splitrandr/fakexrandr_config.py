@@ -339,6 +339,43 @@ def _activate_screensaver_override():
         log.warning("could not restart cinnamon-screensaver: %s", e)
 
 
+# gsettings keys that gate cinnamon's automatic lock. Disabling these is the
+# only fix that reliably keeps the lock screen from trapping the user on this
+# split-monitor rig.
+_LOCK_GSETTINGS = (
+    ("org.cinnamon.desktop.screensaver", "lock-enabled", "false"),
+    ("org.cinnamon.desktop.screensaver", "lock-delay", "uint32 0"),
+    ("org.cinnamon.desktop.session", "idle-delay", "uint32 0"),
+)
+
+
+def disable_screensaver_lock():
+    """Disable cinnamon's automatic screen lock while the split is active.
+
+    On this virtual-split rig the lock screen is broken: cinnamon-screensaver
+    cannot draw its real unlock UI over the split monitors, so it falls back to
+    cs-backup-locker -- a bare black grab with NO password prompt, which locks
+    the user out unrecoverably. This was verified 2026-07-14: even with the
+    fakexrandr screensaver override active and the screensaver seeing the same
+    6 monitors as muffin (rects agree), triggering a lock still spawned
+    cs-backup-locker. So the shim override (write_screensaver_dbus_override) is
+    necessary-but-insufficient; the lock itself must be disabled.
+
+    Sets lock-enabled=false and idle-delay=0 so nothing auto-activates a lock.
+    Persists in the user's dconf; re-applied on every split apply so it can't
+    silently regress. Re-enable with `gsettings reset` on the same keys once the
+    lock-screen rendering bug is fixed upstream.
+    """
+    for schema, key, value in _LOCK_GSETTINGS:
+        try:
+            subprocess.run(['gsettings', 'set', schema, key, value],
+                           capture_output=True, timeout=5)
+        except Exception as e:
+            log.warning("could not set %s %s=%s: %s", schema, key, value, e)
+    log.info("disabled cinnamon auto-lock (broken lock UI falls back to "
+             "cs-backup-locker black grab on split monitors)")
+
+
 def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
     """Write ~/.config/fakexrandr.bin from the current split configuration.
 
@@ -784,8 +821,13 @@ def restart_cinnamon_with_fakexrandr(lib_path=None):
 
     # Keep the lock screen in lockstep: give cinnamon-screensaver the same
     # fakexrandr preload path muffin is about to get, so it sees the split
-    # monitors instead of wedging when they change under a lock.
+    # monitors instead of wedging when they change under a lock. (Necessary
+    # but NOT sufficient -- see disable_screensaver_lock below.)
     write_screensaver_dbus_override(lib_path)
+    # The lock UI is broken on split monitors and falls back to the
+    # cs-backup-locker black grab (verified even when monitor rects agree), so
+    # the automatic lock must be disabled outright or it traps the user.
+    disable_screensaver_lock()
 
     env = os.environ.copy()
     existing = env.get('LD_PRELOAD', '')
