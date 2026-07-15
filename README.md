@@ -6,7 +6,7 @@ SplitRandR is focused on **Linux Mint / Cinnamon** desktops, where the Muffin wi
 
 ![SplitRandR main interface](screenshots/splitrandr-main.png)
 
-![Split monitors in Cinnamon display settings](screenshots/cinnamon-split-monitors.png)
+![Split editor with presets and drag-to-split regions](screenshots/split-editor.png)
 
 **This is experimental software.** It is unlikely to work on your system without some tweaking. It was developed against a specific hardware setup (Samsung Odyssey Ark + Acer HDMI monitor on Cinnamon 6.x / Fedora) and the workarounds are tailored to that environment.
 
@@ -18,7 +18,7 @@ SplitRandR is focused on **Linux Mint / Cinnamon** desktops, where the Muffin wi
 - Bundles a modified fakexrandr library that presents those splits as real outputs/CRTCs to window managers
 - Handles Cinnamon-specific crash workarounds (SIGSTOP/SIGCONT during setmonitor calls)
 - Writes `cinnamon-monitors.xml` so display settings (positions, modes, primary) survive Cinnamon restarts
-- Supports profiles, autostart scripts, and a system tray icon
+- Supports named profiles, a login-layout autostart, and a system tray icon
 
 ## Why Cinnamon?
 
@@ -34,7 +34,7 @@ The Cinnamon focus exists because:
 
 2. **Muffin uses both libXrandr and libxcb-randr**. The fakexrandr library intercepts libXrandr calls via LD_PRELOAD, but Muffin also makes direct xcb-randr calls that bypass the interception. The vendored fakexrandr includes additional xcb-randr interceptors for `set_crtc_config`, `set_crtc_transform`, and `change_output_property` to handle this.
 
-3. **Cinnamon's display persistence** uses `~/.config/cinnamon-monitors.xml`. When Cinnamon restarts, it reads this file to restore display settings. SplitRandR writes this file with correct entries for both the split layout (fake output connectors like `DP-5~1`, `DP-5~2`) and the unsplit layout, so settings survive restarts.
+3. **Cinnamon's display persistence** uses `~/.config/cinnamon-monitors.xml` (mutter's monitors.xml v2 format). Muffin only applies a stored configuration when it matches the connected monitor set exactly — connector/vendor/product/serial strings byte-for-byte, disabled monitors listed in `<disabled>`, and mode rates within 0.001 Hz of `dotClock / (hTotal × vTotal)`. On any mismatch it silently falls back to a generated config that enables every connected output. SplitRandR therefore writes the file in the *shim's* view: one logicalmonitor per split leaf (leaf 0 keeps the parent connector name, later leaves are `NAME~1`…), `unknown` specs for the EDID-less fake outputs, computed-precision rates, and `<disabled>` entries for outputs you turned off — so the layout, including deliberately disabled outputs, survives restarts.
 
 Other desktop environments have their own quirks and would need their own workarounds. The approach taken here is in principle applicable to GNOME, KDE, etc., but the crash workarounds, config file format, and xcb interception details would differ.
 
@@ -44,14 +44,17 @@ Other desktop environments have their own quirks and would need their own workar
 
 ```
 SplitRandR (Python/GTK3)
-├── gui.py          - Main application window
-├── widget.py       - Monitor preview/layout widget (from ARandR)
-├── xrandr.py       - XRandR wrapper with --setmonitor support
-├── splits.py       - Binary split tree model (proportional 0.0-1.0)
+├── gui.py            - Application entry point, CLI options, singleton lock
+├── gui_app_*.py      - Main window: layout canvas, controls, apply flow, profiles
+├── gui_screen_watcher.py - Re-applies the layout on unlock/wake/hotplug
+├── widget.py         - Monitor preview/layout widget (from ARandR)
+├── xrandr.py         - XRandR wrapper (+ xrandr_load/save/invoke mixins)
+├── splits.py         - Binary split tree model (proportional 0.0-1.0)
+├── compositor.py     - Cinnamon/GNOME abstraction (names, buses, capability flags)
 ├── cinnamon_compat.py - SIGSTOP/SIGCONT guard for Muffin crash
-├── fakexrandr_config.py - Binary config writer + monitors.xml writer
-├── profiles.py     - Named profile management
-└── tray.py         - System tray (XApp → GtkStatusIcon → AppIndicator3 fallback)
+├── fakexrandr_config.py - fakexrandr.bin writer + monitors.xml writer + restarts
+├── profiles.py       - Named profile management
+└── tray.py           - System tray (XApp → GtkStatusIcon → AppIndicator3 fallback)
 
 fakexrandr/ (vendored C library)
 └── libXrandr.c     - LD_PRELOAD interception of libXrandr + libxcb-randr
@@ -75,24 +78,30 @@ Each split has a direction (`H` for horizontal line, `V` for vertical line) and 
 
 When you click **Apply**:
 
-1. `~/.config/fakexrandr.bin` is cleared so xrandr sees real physical outputs (not fakexrandr virtual ones)
+1. Every `xrandr` subprocess runs with `LD_PRELOAD` stripped from its environment, so it always operates on the real X server state even when SplitRandR itself was launched from a preloaded session
 2. `xrandr --output ... --mode ... --pos ...` sets the physical output configuration
 3. Inside a `CinnamonSetMonitorGuard` (SIGSTOPs Cinnamon):
    - Existing virtual monitors (`OUTPUT~N`) are deleted
    - New virtual monitors are created via `xrandr --setmonitor`
-   - The fakexrandr binary config (`~/.config/fakexrandr.bin`) is written
-4. `cinnamon-monitors.xml` is written with correct positions/modes for all outputs
-5. If Cinnamon doesn't have fakexrandr loaded (checked via `/proc/PID/maps`):
-   - Cinnamon is restarted with `LD_PRELOAD=.../libXrandr.so.2 cinnamon --replace`
-   - After settling, the xrandr config and setmonitor commands are re-applied
-   - The fakexrandr binary config is re-written
-6. `xapp-sn-watcher` is restarted so AppIndicator3 tray menus pick up the new monitor geometry (its GDK caches the layout at startup)
+   - The fakexrandr binary config (`~/.config/fakexrandr.bin`) is written atomically (tmp file + rename — a truncate-in-place is visible to a concurrently-reading Cinnamon and crashes it)
+4. `cinnamon-monitors.xml` is written in the shim's view (see above)
+5. Cinnamon is restarted with `LD_PRELOAD=.../libXrandr.so.2 cinnamon --replace` only when needed: the shim is missing or stale in the WM process (checked via `/proc/PID/maps`), or this apply actually changed `fakexrandr.bin` (Muffin caches its MetaMonitor list and only rebuilds it across a restart). Applies that don't touch splits — like disabling an output — do not restart the WM
+6. Auto-lock is disabled (`lock-enabled=false`) on every restart with splits, because cinnamon-screensaver's lock screen cannot render over split monitors and falls back to `cs-backup-locker`, an unrecoverable black grab
+7. `xapp-sn-watcher` is restarted so AppIndicator3 tray menus pick up the new monitor geometry (its GDK caches the layout at startup)
 
 ### fakexrandr binary config format
 
-The config file (`~/.config/fakexrandr.bin`) is a sequence of entries:
+The config file (`~/.config/fakexrandr.bin`, format version 3) is a header followed by a sequence of entries:
 
 ```
+Header:
+  <magic:        4 bytes>             "FXRD"
+  <version:      4 bytes, uint32>     3
+  <primary_name: 128 bytes, padded>   Connector that owns XRRGetOutputPrimary
+                                      (leaf 0 keeps the parent name; set even
+                                      with no splits, to defeat Mutter's
+                                      leftmost-monitor primary default)
+
 Entry:
   <length:       4 bytes, uint32>     Total length of payload
   <output_name:  128 bytes, padded>   e.g. "DP-5"
@@ -100,6 +109,9 @@ Entry:
   <width:        4 bytes, uint32>     Output width in pixels
   <height:       4 bytes, uint32>     Output height in pixels
   <split_count:  4 bytes, uint32>     Number of leaf regions
+  <border:       4 bytes, uint32>     Dead-zone border between splits, pixels
+  <primary_leaf: 4 bytes, uint32>     Spatial index of the primary leaf,
+                                      0xFFFFFFFF if none
   <tree_data:    variable>            Serialized binary tree
 
 Tree node:
@@ -116,14 +128,16 @@ The vendored fakexrandr intercepts at two levels:
 
 **libXrandr level** (standard LD_PRELOAD):
 - `XRRGetScreenResources` / `XRRGetScreenResourcesCurrent` — augmented with fake outputs, CRTCs, and modes
+- `XRRGetMonitors` — synthesizes one RandR monitor per split leaf and filters out the server-side `--setmonitor` virtual monitors, so a preloaded client sees each split exactly once (leaf 0 is folded into the parent connector name)
 - `XRRGetOutputInfo` — returns fake output info for split regions
 - `XRRGetCrtcInfo` — returns fake CRTC info with correct geometry
 - `XRRSetCrtcConfig` — no-op for fake CRTCs (updates internal state)
+- `XRRGetOutputPrimary` — reports the configured primary leaf
 - `XRRGetOutputProperty` — returns empty for fake outputs (no EDID)
 - `XSetErrorHandler` — intercepts to suppress BadRROutput errors
 
-**libxcb-randr level** (additional interception for Muffin):
-- `xcb_randr_set_crtc_config` — no-op for fake CRTCs
+**libxcb-randr level** (additional interception for Muffin, which bypasses libXrandr for these):
+- `xcb_randr_set_crtc_config` (+ `_checked`, `_reply`) — no-op for fake CRTCs; also **blocks disables of real CRTCs while splits are active** (Mutter's initial config apply would otherwise turn off the parent CRTC that backs the fakes)
 - `xcb_randr_set_crtc_transform` — no-op for fake CRTCs
 - `xcb_randr_change_output_property` — no-op for fake outputs
 
@@ -157,6 +171,14 @@ It is written idempotently from two places: `restart_cinnamon_with_fakexrandr`
 session bus is asked to `ReloadConfig` and any running screensaver is dropped
 so the next on-demand activation carries the preload — this does not lock the
 screen. Delete the file and reload dbus to restore the stock screensaver.
+
+The override turned out to be necessary but not sufficient: even with the
+screensaver seeing the same monitor set as muffin, triggering a lock on a
+split layout still spawned `cs-backup-locker`. Since 0.6.0,
+`disable_screensaver_lock()` therefore also sets `lock-enabled=false`
+(plus `idle-delay=0`, `lock-delay=0`) on every split apply. Re-enable with
+`gsettings reset` on those keys once the upstream lock-screen rendering bug
+is fixed — but expect the backup-locker trap until then.
 
 ### Running on GNOME (Xorg)
 
@@ -227,6 +249,17 @@ The autostart script needs to:
 
 But at login, Cinnamon may not be fully started yet. The autostart `.desktop` entry runs the saved shell script, which includes the Cinnamon SIGSTOP/SIGCONT wrapper inline. This mostly works but timing-sensitive.
 
+## Installing (Fedora)
+
+Packages are published on COPR for the currently supported Fedora releases:
+
+```sh
+sudo dnf copr enable reversejames/splitrandr
+sudo dnf install splitrandr
+```
+
+The RPM ships the prebuilt fakexrandr library at `/usr/local/lib64/libXrandr.so.2` (deliberately outside the linker search path, so it never shadows the real libXrandr for anything that isn't explicitly preloaded).
+
 ## Requirements
 
 - Python 3
@@ -254,20 +287,27 @@ python -m splitrandr
 ## Usage
 
 1. Launch SplitRandR
-2. Click on a monitor in the preview to select it
-3. Use the controls below to set resolution, refresh rate, position
-4. Click **Split Monitor...** to open the split editor — drag to create splits, right-click a split line to remove it
-5. Click **Apply** to apply the configuration
-6. Click **Apply & Autostart** to also save and register for login autostart
+2. Drag monitors in the *Proposed* pane to position them; select one to edit it
+3. Use the per-monitor list below the canvas to set resolution, refresh rate, rotation, primary, and split border
+4. Click the **Split \<output\>…** button for a monitor to open the split editor — pick a preset or drag inside a region to split it, drag a line to resize, right-click a line to remove it
+5. Click **Apply** in the header bar to apply the configuration
+6. Use **Apply & Set Login Layout** in the hamburger menu to also save the layout for login autostart
 
 ### CLI options
 
 ```
-splitrandr --regenerate   # Regenerate autostart script and active profile
-                          # from the current X state without opening the GUI
+splitrandr --apply [file]     # Apply a saved layout JSON (default:
+                              # ~/.config/splitrandr/layout.json) and exit;
+                              # this is what the login autostart runs
+splitrandr --watch            # Headless watcher: re-applies the active
+                              # profile on unlock, wake, and monitor hotplug
+splitrandr --regenerate       # Regenerate the autostart layout and active
+                              # profile from the current X state
+splitrandr --update-configs   # Rewrite fakexrandr.bin and
+                              # cinnamon-monitors.xml from the current X state
 ```
 
-This is useful after updating SplitRandR to pick up new script features (e.g. `fakexrandr.bin` clearing, `xapp-sn-watcher` restart) without re-doing your layout.
+`--regenerate` is useful after updating SplitRandR so the saved layout picks up new apply-flow features without re-doing your layout.
 
 ## Credits
 

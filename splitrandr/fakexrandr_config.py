@@ -379,8 +379,9 @@ def disable_screensaver_lock():
 def write_fakexrandr_config(splits_dict, xrandr_state, xrandr_config, borders_dict=None):
     """Write ~/.config/fakexrandr.bin from the current split configuration.
 
-    Binary format (version 2):
+    Binary format (version 3):
         Header: b"FXRD" + <version:4B uint>
+                + <primary_connector_name:128B padded>
         Per entry:
             <length:4B uint><name:128B padded><edid:768B padded>
             <width:4B uint><height:4B uint><split_count:4B uint><border:4B uint>
