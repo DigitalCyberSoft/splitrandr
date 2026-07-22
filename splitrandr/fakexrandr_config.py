@@ -807,6 +807,148 @@ def _indent_xml(elem, level=0):
             elem.tail = indent
 
 
+SESSION_PRELOAD_BEGIN = '# >>> splitrandr session preload >>>'
+SESSION_PRELOAD_END = '# <<< splitrandr session preload <<<'
+BASH_PROFILE_PATH = os.path.expanduser('~/.bash_profile')
+ENVIRONMENT_D_PATH = os.path.join(
+    os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')),
+    'environment.d', '90-splitrandr.conf')
+
+
+def _rewrite_marked_block(path, block):
+    """Insert, replace, or (block=None) remove the splitrandr-marked
+    block in a user dotfile, preserving everything else byte-for-byte.
+    Atomic via tmp+rename. Returns True if the file changed."""
+    try:
+        with open(path) as f:
+            original = f.read()
+    except FileNotFoundError:
+        original = ''
+    lines = original.splitlines(keepends=True)
+    out = []
+    inside = False
+    for line in lines:
+        if line.rstrip('\n') == SESSION_PRELOAD_BEGIN:
+            inside = True
+            continue
+        if line.rstrip('\n') == SESSION_PRELOAD_END:
+            inside = False
+            continue
+        if not inside:
+            out.append(line)
+    stripped = ''.join(out)
+    if block is not None:
+        if stripped and not stripped.endswith('\n'):
+            stripped += '\n'
+        stripped += block
+    if stripped == original:
+        return False
+    tmp = path + '.splitrandr-tmp'
+    with open(tmp, 'w') as f:
+        f.write(stripped)
+    try:
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+    except FileNotFoundError:
+        pass
+    os.replace(tmp, path)
+    return True
+
+
+def _bash_profile_block(lib_path):
+    # The lightdm session chain is `exec -l /bin/bash -c
+    # cinnamon-session-cinnamon` (a login bash), so ~/.bash_profile is
+    # what the X session actually sources on this setup — Fedora's
+    # /etc/X11/xinit/Xsession does NOT read ~/.xprofile. The case guard
+    # limits the export to local displays (":0"), keeping the shim out
+    # of ssh -X logins, whose forwarded display has different geometry.
+    return (
+        '%s\n'
+        '# Managed by splitrandr — do not edit inside the markers.\n'
+        '# Preloads the fakexrandr shim into the whole X session so\n'
+        '# apps not launched by Cinnamon (D-Bus activated, autostarted)\n'
+        '# see the same split monitors as the WM. GTK3 mishandles the\n'
+        '# raw output-less setmonitor VMs (menus on the wrong screen).\n'
+        '# Withdrawn automatically when a layout with no splits is\n'
+        '# applied; delete this block to remove it manually.\n'
+        'case "$DISPLAY" in\n'
+        ':*)\n'
+        '    export LD_PRELOAD="%s${LD_PRELOAD:+:$LD_PRELOAD}"\n'
+        '    ;;\n'
+        'esac\n'
+        '%s\n' % (SESSION_PRELOAD_BEGIN, lib_path, SESSION_PRELOAD_END)
+    )
+
+
+def _push_activation_environment(value):
+    """Set LD_PRELOAD for the live session's D-Bus activation and
+    systemd --user manager, so newly activated services pick it up
+    without a re-login. value='' effectively clears it (the D-Bus
+    activation environment cannot unset, only overwrite)."""
+    env = os.environ.copy()
+    env.pop('LD_PRELOAD', None)
+    try:
+        subprocess.run(
+            ['dbus-update-activation-environment', '--systemd',
+             'LD_PRELOAD=%s' % value],
+            capture_output=True, timeout=10, env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("dbus-update-activation-environment failed: %s", e)
+    if not value:
+        try:
+            subprocess.run(
+                ['systemctl', '--user', 'unset-environment', 'LD_PRELOAD'],
+                capture_output=True, timeout=10, env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("systemctl unset-environment failed: %s", e)
+
+
+def enable_session_preload(lib_path=None):
+    """Make the fakexrandr shim session-wide: login shells (next
+    login), systemd user units (next login/daemon-reload), and the
+    live session's D-Bus/systemd activation environments (immediate).
+    Idempotent; rewrites paths when the installed .so moves."""
+    if lib_path is None:
+        lib_path = _find_fakexrandr_lib()
+    if not lib_path:
+        log.warning("session preload: fakexrandr library not found")
+        return False
+    changed = _rewrite_marked_block(
+        BASH_PROFILE_PATH, _bash_profile_block(lib_path))
+    os.makedirs(os.path.dirname(ENVIRONMENT_D_PATH), exist_ok=True)
+    conf = ('# Managed by splitrandr — session-wide fakexrandr preload.\n'
+            'LD_PRELOAD=%s\n' % lib_path)
+    try:
+        with open(ENVIRONMENT_D_PATH) as f:
+            conf_changed = f.read() != conf
+    except FileNotFoundError:
+        conf_changed = True
+    if conf_changed:
+        tmp = ENVIRONMENT_D_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(conf)
+        os.replace(tmp, ENVIRONMENT_D_PATH)
+    _push_activation_environment(lib_path)
+    if changed or conf_changed:
+        log.info("session-wide preload enabled (%s)", lib_path)
+    return True
+
+
+def disable_session_preload():
+    """Withdraw the session-wide preload from every injection point."""
+    changed = _rewrite_marked_block(BASH_PROFILE_PATH, None)
+    try:
+        os.unlink(ENVIRONMENT_D_PATH)
+        changed = True
+    except FileNotFoundError:
+        pass
+    _push_activation_environment('')
+    if changed:
+        log.info("session-wide preload disabled")
+    return True
+
+
 class _XRRScreenResources(ctypes.Structure):
     _fields_ = [
         ('timestamp', ctypes.c_ulong),

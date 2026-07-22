@@ -1132,6 +1132,39 @@ static int _input_is_setmonitor_vm_to_skip(Display *dpy, XRRScreenResources *res
 }
 
 /*
+	Resolve the real RROutput whose connector name equals a monitor's
+	base name (the part before '~').
+
+	Output-less setmonitor VMs (leaves registered with output "none")
+	are returned by the server with noutput == 0. GTK3's init_randr15
+	(gtk 3.24, gdk/x11/gdkscreen-x11.c) dereferences outputs[0] of
+	every XRRMonitorInfo without checking noutput, reads heap garbage,
+	and silently DROPS the monitor whenever the garbage doesn't decode
+	to a connected output — whole split regions vanish from a client's
+	monitor list and popup menus get placed on the wrong screen.
+	XRRGetMonitors' passthrough uses this to hand every such VM its
+	parent output, so outputs[0] is always valid. GTK only uses it for
+	the connection check, EDID, and refresh rate; the monitor's
+	name/geometry come from the XRRMonitorInfo record itself.
+*/
+static RROutput _real_output_for_monitor_base(Display *dpy, XRRScreenResources *res,
+		const char *atom_name) {
+	char base_name[128];
+	strncpy(base_name, atom_name, sizeof(base_name) - 1);
+	base_name[sizeof(base_name) - 1] = '\0';
+	char *tilde = strchr(base_name, '~');
+	if(tilde) *tilde = '\0';
+	for(int j = 0; j < res->noutput; j++) {
+		XRROutputInfo *oi = _XRRGetOutputInfo(dpy, res, res->outputs[j]);
+		if(!oi) continue;
+		int match = oi->name && strcmp(oi->name, base_name) == 0;
+		_XRRFreeOutputInfo(oi);
+		if(match) return res->outputs[j];
+	}
+	return None;
+}
+
+/*
 	Pass 1 dimension-check helper: for an automatic input, returns
 	the number of split regions iff the fakexrandr config dims
 	match the CRTC dims (0 in config = match anything). Returns 0
@@ -1356,9 +1389,11 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 			continue;
 		}
 
-		/* Non-split monitor: keep as-is */
+		/* Non-split monitor: keep as-is. Reserve one output slot even
+		 * for output-less VMs — Pass 2 backfills the parent output so
+		 * GTK3's unchecked outputs[0] read stays in bounds. */
 		total_monitors++;
-		total_outputs += orig[i].noutput;
+		total_outputs += orig[i].noutput ? orig[i].noutput : 1;
 		XFree(atom_name);
 	}
 
@@ -1411,8 +1446,23 @@ XRRMonitorInfo *XRRGetMonitors(Display *dpy, Window window, int get_active, int 
 		/* Non-split monitor: copy as-is */
 		result[out_idx] = orig[i];
 		result[out_idx].outputs = &output_pool[out_output_idx];
-		memcpy(result[out_idx].outputs, orig[i].outputs, orig[i].noutput * sizeof(RROutput));
-		out_output_idx += orig[i].noutput;
+		if(orig[i].noutput > 0) {
+			memcpy(result[out_idx].outputs, orig[i].outputs, orig[i].noutput * sizeof(RROutput));
+			out_output_idx += orig[i].noutput;
+		} else {
+			/* Backfill the parent output for output-less VMs so
+			 * GTK3's unchecked outputs[0] read (init_randr15) hits a
+			 * real connected output instead of heap garbage — see
+			 * _real_output_for_monitor_base. */
+			RROutput parent = _real_output_for_monitor_base(dpy, res, atom_name);
+			if(parent != None) {
+				result[out_idx].outputs[0] = parent;
+				result[out_idx].noutput = 1;
+				out_output_idx += 1;
+				FXLOG("  passthrough backfill: %s gets parent output 0x%lx",
+				      atom_name, (unsigned long)parent);
+			}
+		}
 		/* Global primary_connector_name (v3+) overrides the X server's
 		 * primary flag. This is the path that handles native EDID-tile
 		 * connectors (e.g. DP-5~3 on Nvidia tiled panels) where no

@@ -415,6 +415,21 @@ class XRandRSaveMixin:
             elif not has_splits and is_cinnamon_fakexrandr_loaded():
                 log.info("no splits active, restarting Cinnamon without fakexrandr")
                 restart_cinnamon_without_fakexrandr()
+
+            # Keep the session-wide preload in sync with split state, so
+            # apps NOT launched from the preloaded Cinnamon lineage
+            # (D-Bus activation, systemd user services, login autostart)
+            # see the synthesized monitor set too. Un-preloaded GTK3
+            # drops output-less setmonitor VMs nondeterministically
+            # (init_randr15 reads outputs[0] without checking noutput)
+            # and then positions popup menus on the wrong screen.
+            from .fakexrandr_config import (
+                enable_session_preload, disable_session_preload,
+            )
+            if has_splits:
+                enable_session_preload()
+            else:
+                disable_session_preload()
         except Exception as e:
             log.warning("fakexrandr cinnamon restart failed: %s", e)
 

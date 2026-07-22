@@ -136,6 +136,8 @@ The vendored fakexrandr intercepts at two levels:
 - `XRRGetOutputProperty` — returns empty for fake outputs (no EDID)
 - `XSetErrorHandler` — intercepts to suppress BadRROutput errors
 
+`XRRGetMonitors` also guarantees `noutput >= 1` on every monitor it returns, backfilling output-less setmonitor VMs with their parent output: GTK3's `init_randr15` reads `outputs[0]` without checking `noutput` (gtk 3.24, `gdk/x11/gdkscreen-x11.c`), so a raw output-less VM gets included or dropped depending on heap garbage — dropped regions make GTK apps place popup menus on the wrong screen.
+
 **libxcb-randr level** (additional interception for Muffin, which bypasses libXrandr for these):
 - `xcb_randr_set_crtc_config` (+ `_checked`, `_reply`) — no-op for fake CRTCs; also **blocks disables of real CRTCs while splits are active** (Mutter's initial config apply would otherwise turn off the parent CRTC that backs the fakes)
 - `xcb_randr_set_crtc_transform` — no-op for fake CRTCs
@@ -179,6 +181,30 @@ split layout still spawned `cs-backup-locker`. Since 0.6.0,
 (plus `idle-delay=0`, `lock-delay=0`) on every split apply. Re-enable with
 `gsettings reset` on those keys once the upstream lock-screen rendering bug
 is fixed — but expect the backup-locker trap until then.
+
+### Session-wide preload
+
+The GTK3 `outputs[0]` bug above can only be fully avoided by making sure
+apps load the shim, whose `XRRGetMonitors` always returns GTK-safe
+records. Applying a layout **with splits** therefore installs a
+session-wide `LD_PRELOAD` at three injection points, and applying a
+layout **without splits** withdraws all three:
+
+- a marked block in `~/.bash_profile` (the lightdm session chain runs a
+  login bash; the block is gated to local `:N` displays so ssh logins
+  are unaffected) — covers everything Cinnamon and the session autostart
+  spawn at the next login;
+- `~/.config/environment.d/90-splitrandr.conf` — covers systemd user
+  services;
+- `dbus-update-activation-environment --systemd` — covers D-Bus and
+  systemd activation in the *current* session immediately.
+
+Already-running apps keep their environment; restart them (or log out
+and back in) to pick up the preload. The shim passes through untouched
+when `~/.config/fakexrandr.bin` is absent, and the dynamic linker
+ignores `LD_PRELOAD` for setuid binaries. 32-bit programs print a
+one-line "wrong ELF class" warning on stderr since only a 64-bit shim
+is shipped; the warning is harmless.
 
 ### Running on GNOME (Xorg)
 
