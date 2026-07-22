@@ -189,7 +189,41 @@ class Application(
         return False  # one-shot idle callback
 
 
+def _strip_own_preload():
+    """Re-exec without the fakexrandr shim if this process inherited it.
+
+    splitrandr manages the REAL display state; launched from a preloaded
+    lineage (Cinnamon menu items inherit the WM's LD_PRELOAD, and the
+    session-wide preload reaches everything else), its own GDK/Xlib view
+    becomes the synthesized one — fake EDID-less outputs, folded leaf
+    names, leaf outputs listed as physical monitors in the controls, and
+    split trees that fail to reconstruct. xrandr SUBPROCESSES were
+    always stripped (xrandr_invoke._xrandr_env); this strips the process
+    itself. exec-time interposition can't be undone in-process, hence
+    the re-exec.
+    """
+    import sys
+    preload = os.environ.get('LD_PRELOAD', '')
+    if not preload:
+        return
+    from .fakexrandr_config import _is_fake_xrandr_lib_path
+    parts = [p for p in preload.split(':') if p]
+    kept = [p for p in parts if not _is_fake_xrandr_lib_path(p)]
+    if len(kept) == len(parts):
+        return
+    if kept:
+        os.environ['LD_PRELOAD'] = ':'.join(kept)
+    else:
+        os.environ.pop('LD_PRELOAD', None)
+    if os.path.basename(sys.argv[0]) == '__main__.py':
+        argv = [sys.executable, '-m', 'splitrandr'] + sys.argv[1:]
+    else:
+        argv = [sys.executable] + sys.argv
+    os.execv(sys.executable, argv)
+
+
 def main():
+    _strip_own_preload()
     logging.basicConfig(
         level=logging.INFO,
         format='%(name)s: %(message)s',
