@@ -262,7 +262,20 @@ class ScreenWatcher:
 
     @staticmethod
     def _layout_matches(profile_name):
-        """Check if current X layout matches the profile without modifying anything."""
+        """Check if current X layout matches the profile without modifying anything.
+
+        Both xrandr calls run with LD_PRELOAD stripped and therefore see
+        the REAL server state. This function used to run a shimmed
+        ``xrandr --query``: in a preloaded watcher process that query is
+        synthesized from fakexrandr.bin, so it kept "matching" the
+        profile even after ``_teardown_splits_now`` had deleted the real
+        setmonitor VMs — the re-apply was skipped forever and every
+        un-preloaded app (Evolution, anything D-Bus-activated) was left
+        looking at unsplit monitors, popping menus on the wrong screen.
+        The split VMs must be validated against the real server, where
+        RandR emits no event for their absence (see
+        nudge_gtk_monitor_refresh in fakexrandr_config).
+        """
         import json, re, subprocess
         try:
             path = profiles.profile_path(profile_name)
@@ -274,12 +287,36 @@ class ScreenWatcher:
         expected_outputs = data.get('outputs', {})
         expected_splits = data.get('splits', {})
 
+        env = dict(os.environ)
+        env.pop('LD_PRELOAD', None)  # real server state, never the shim view
+
         # Query current output positions and modes
         try:
             raw = subprocess.run(
                 ['xrandr', '--query'],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, env=env,
             ).stdout
+        except Exception:
+            return False
+
+        # Real setmonitor VMs, name -> (w, h, x, y). Rows look like
+        # " 0: HDMI-0~0 2496/786x648/204+3840+0  HDMI-0".
+        current_vms = {}
+        try:
+            mon_raw = subprocess.run(
+                ['xrandr', '--listmonitors'],
+                capture_output=True, text=True, timeout=5, env=env,
+            ).stdout
+            for line in mon_raw.splitlines():
+                parts = line.split()
+                if len(parts) < 3 or not parts[0].rstrip(':').isdigit():
+                    continue
+                m = re.match(r'(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)', parts[2])
+                if m:
+                    current_vms[parts[1].lstrip('+*')] = (
+                        int(m.group(1)), int(m.group(2)),
+                        int(m.group(3)), int(m.group(4)),
+                    )
         except Exception:
             return False
 
@@ -303,15 +340,11 @@ class ScreenWatcher:
                     )
                     break
 
-        # Check each expected output's position and mode size.
-        # Skip split outputs — fakexrandr hides the physical output
-        # (e.g. DP-5 becomes DP-5~1/~2/~3), so it won't appear in
-        # xrandr --query.  Those are validated by the virtual monitor
-        # existence check below.
+        # Check each expected output's position and mode size against
+        # the real query — the real server never hides split outputs,
+        # so every active output must appear, split or not.
         for name, out_data in expected_outputs.items():
             if not out_data.get('active'):
-                continue
-            if name in expected_splits and expected_splits[name].get('d'):
                 continue
             pos = out_data.get('position', [0, 0])
             mode = out_data.get('mode', '')
@@ -352,9 +385,6 @@ class ScreenWatcher:
         for output_name, tree_data in expected_splits.items():
             if not (tree_data and tree_data.get('d')):
                 continue
-            if output_name + '~' not in raw:
-                _sw_log.info("virtual outputs missing for %s", output_name)
-                return False
             out_data = expected_outputs.get(output_name, {})
             try:
                 mw, mh = out_data['mode'].split('x')
@@ -363,44 +393,35 @@ class ScreenWatcher:
             except (KeyError, ValueError, AttributeError):
                 continue
             for i, (lx, ly, lw, lh) in enumerate(_leaf_regions(tree_data, pw, ph)):
-                # The watcher runs with LD_PRELOAD, so this xrandr --query
-                # is hooked: the .so folds split leaf 0 into the bare parent
-                # name and numbers the rest from ~1 (leaf 1 -> NAME~1). Match
-                # that naming — leaf 0 is NAME, leaf i>=1 is NAME~i.
-                # See feedback_layout_matches_offbyone.
-                fake_name = output_name if i == 0 else "%s~%d" % (output_name, i)
+                # Real setmonitor VMs are 0-indexed: leaf 0 is NAME~0
+                # (claiming the physical output), unlike the shim's
+                # folded view where leaf 0 keeps the bare parent name.
+                vm_name = "%s~%d" % (output_name, i)
                 expected = (lw, lh, px + lx, py + ly)
-                actual = current.get(fake_name)
+                actual = current_vms.get(vm_name)
                 if actual != expected:
-                    _sw_log.info("split geometry mismatch on %s: expected %s, got %s",
-                                fake_name, expected, actual)
+                    _sw_log.info("split VM mismatch on %s: expected %s, got %s",
+                                vm_name, expected, actual)
                     return False
 
-        # Check primary output. If the primary output has splits,
-        # fakexrandr presents the first fake (NAME~1) as primary, so
-        # accept either the physical name or any of its fakes.
+        # Check primary output against the real query.
         expected_primary = next(
             (n for n, d in expected_outputs.items()
              if d.get('active') and d.get('primary')),
             None,
         )
         if expected_primary != current_primary:
-            split_data = expected_splits.get(expected_primary or '')
-            has_splits = bool(split_data and split_data.get('d'))
-            fake_match = (has_splits and current_primary
-                          and current_primary.startswith(expected_primary + '~'))
-            if not fake_match:
-                # Nvidia tiled-display hardware: --primary on a sub-tile
-                # gets eaten by the driver's collapse/re-expand cycle,
-                # so xrandr --query reports no primary at all. Treat
-                # "X knows nothing about primary" as not-a-mismatch —
-                # otherwise every monitors-changed event would loop us
-                # back into a re-apply that can't make X agree anyway.
-                if current_primary is None:
-                    return True
-                _sw_log.info("primary mismatch: expected %s, got %s",
-                            expected_primary, current_primary)
-                return False
+            # Nvidia tiled-display hardware: --primary on a sub-tile
+            # gets eaten by the driver's collapse/re-expand cycle,
+            # so xrandr --query reports no primary at all. Treat
+            # "X knows nothing about primary" as not-a-mismatch —
+            # otherwise every monitors-changed event would loop us
+            # back into a re-apply that can't make X agree anyway.
+            if current_primary is None:
+                return True
+            _sw_log.info("primary mismatch: expected %s, got %s",
+                        expected_primary, current_primary)
+            return False
 
         return True
 

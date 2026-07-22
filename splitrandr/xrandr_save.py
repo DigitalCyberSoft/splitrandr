@@ -523,6 +523,14 @@ class XRandRSaveMixin:
         except Exception as e:
             log.warning("pin_panels_to_primary failed: %s", e)
 
+        # Last: wake every running GTK client. setmonitor/delmonitor
+        # emit no RandR events, so without this, apps that aren't
+        # LD_PRELOADed (Evolution, D-Bus-activated processes) keep a
+        # stale GdkMonitor list and pop context menus on the wrong
+        # screen until they are restarted.
+        from .fakexrandr_config import nudge_gtk_monitor_refresh
+        nudge_gtk_monitor_refresh()
+
         log.info("=== save_to_x: done ===")
 
     def save_to_json(self, path):

@@ -807,6 +807,104 @@ def _indent_xml(elem, level=0):
             elem.tail = indent
 
 
+class _XRRScreenResources(ctypes.Structure):
+    _fields_ = [
+        ('timestamp', ctypes.c_ulong),
+        ('configTimestamp', ctypes.c_ulong),
+        ('ncrtc', ctypes.c_int),
+        ('crtcs', ctypes.POINTER(ctypes.c_ulong)),
+        ('noutput', ctypes.c_int),
+        ('outputs', ctypes.POINTER(ctypes.c_ulong)),
+        ('nmode', ctypes.c_int),
+        ('modes', ctypes.c_void_p),
+    ]
+
+
+def nudge_gtk_monitor_refresh():
+    """Fire an RRNotify/OutputProperty at every listening X client so
+    running GTK apps re-enumerate their monitor list.
+
+    RandR emits NO client event for ``--setmonitor``/``--delmonitor``
+    (verified against Xorg 21.1.22 with every RRSelectInput mask
+    registered: monitor add/remove/replace produced zero events). So a
+    long-running app that isn't LD_PRELOADed — Evolution, anything
+    D-Bus-activated — keeps the GdkMonitor list it enumerated at
+    startup, and positions popup menus against stale rectangles after
+    any split change ("context menu appears on the wrong screen").
+
+    GTK3's X11 backend selects ``RROutputPropertyNotifyMask`` and
+    re-runs XRRGetMonitors on that event, so changing and deleting a
+    throwaway property on one REAL output refreshes every GTK client
+    (verified live: a stale Gdk process re-enumerated on this exact
+    nudge). Fake (shim-synthesized) outputs must not be used — the
+    shim no-ops property changes on them, so no event would reach the
+    server. Real output XIDs carry none of the XID_SPLIT_MASK bits
+    (0x7FE00000, see libXrandr.c).
+    """
+    XID_SPLIT_MASK = 0x7FE00000
+    XA_INTEGER = 19
+    PROP_MODE_REPLACE = 0
+    try:
+        xlib = ctypes.CDLL('libX11.so.6')
+        xrr = ctypes.CDLL('libXrandr.so.2')
+        xlib.XOpenDisplay.restype = ctypes.c_void_p
+        xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        xlib.XDefaultRootWindow.restype = ctypes.c_ulong
+        xlib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        xlib.XInternAtom.restype = ctypes.c_ulong
+        xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                     ctypes.c_int]
+        xlib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        xrr.XRRGetScreenResourcesCurrent.restype = \
+            ctypes.POINTER(_XRRScreenResources)
+        xrr.XRRGetScreenResourcesCurrent.argtypes = [ctypes.c_void_p,
+                                                     ctypes.c_ulong]
+        xrr.XRRChangeOutputProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_int,
+        ]
+        xrr.XRRDeleteOutputProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+        ]
+        xrr.XRRFreeScreenResources.argtypes = [
+            ctypes.POINTER(_XRRScreenResources)]
+
+        dpy = xlib.XOpenDisplay(None)
+        if not dpy:
+            log.warning("nudge: XOpenDisplay failed")
+            return False
+        try:
+            res = xrr.XRRGetScreenResourcesCurrent(
+                dpy, xlib.XDefaultRootWindow(dpy))
+            if not res:
+                return False
+            target = next(
+                (res.contents.outputs[i] for i in range(res.contents.noutput)
+                 if not res.contents.outputs[i] & XID_SPLIT_MASK),
+                None,
+            )
+            xrr.XRRFreeScreenResources(res)
+            if target is None:
+                log.warning("nudge: no real output found")
+                return False
+            prop = xlib.XInternAtom(dpy, b'_SPLITRANDR_LAYOUT_EPOCH', 0)
+            xrr.XRRChangeOutputProperty(dpy, target, prop, XA_INTEGER, 8,
+                                        PROP_MODE_REPLACE, b'\x01', 1)
+            xlib.XSync(dpy, 0)
+            xrr.XRRDeleteOutputProperty(dpy, target, prop)
+            xlib.XSync(dpy, 0)
+            log.info("nudged GTK monitor refresh via output property "
+                     "on xid=0x%x", target)
+            return True
+        finally:
+            xlib.XCloseDisplay(dpy)
+    except (OSError, AttributeError) as e:
+        log.warning("nudge: %s", e)
+        return False
+
+
 def restart_cinnamon_with_fakexrandr(lib_path=None):
     """Restart the shell (Cinnamon/GNOME) with fakexrandr LD_PRELOAD.
 
