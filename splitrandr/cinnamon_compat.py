@@ -359,6 +359,37 @@ def query_cinnamon_monitors():
     return monitors
 
 
+def cinnamon_shell_health():
+    """Return ``{'monitors': n, 'panels': m}`` from the running shell, or
+    None when Cinnamon isn't answering on D-Bus.
+
+    Exists because muffin can come out of a full output drop with an
+    EMPTY logical monitor list even after a successful xrandr re-apply
+    (2026-08-05 16:29: both outputs returned, X state correct, yet
+    meta_monitor_manager_get_logical_monitor_from_number asserted on an
+    empty list and the panel was never recreated). setmonitor writes are
+    protocol-silent, so nothing else tells muffin to rebuild — the only
+    reliable probe is asking the shell what it believes.
+    """
+    raw = _cinnamon_eval(
+        '(function(){'
+        ' return {monitors: Main.layoutManager.monitors.length,'
+        '         panels: Main.panelManager.panels.filter('
+        'function(p){return !!p;}).length};'
+        '})()'
+    )
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("cinnamon_shell_health: failed to parse %r", raw)
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def pin_panels_to_primary():
     """Rewrite ``org.cinnamon.panels-enabled`` so every panel sits on
     the current primary monitor.
@@ -400,6 +431,7 @@ def pin_panels_to_primary():
     # let any failure bubble up via the catch block as xmon=-2.
     expr = (
         '(function() {'
+        '  if (Main.layoutManager.monitors.length === 0) return {xmon:-3};'
         '  var p = Main.layoutManager.primaryIndex;'
         '  if (p < 0) return {xmon:-1};'
         '  try {'
@@ -422,6 +454,16 @@ def pin_panels_to_primary():
         log.warning("pin_panels_to_primary: failed to parse %r", raw)
         return
     xmon = data.get('xmon', -1)
+    if xmon == -3:
+        # An empty monitor list means the shell is wedged (seen
+        # 2026-08-05 16:29 after a dual-output power drop). Any index
+        # derived from that state is garbage; writing it moved the
+        # panel to a nonexistent monitor ("Monitor 0 not found. Not
+        # creating panel") and it stayed gone until a manual restart.
+        log.warning("pin_panels_to_primary: shell reports ZERO monitors "
+                    "(wedged after an output drop?) -- refusing to "
+                    "rewrite panels-enabled from a broken index")
+        return
     if xmon < 0:
         log.info("pin_panels_to_primary: no primary or wayland (xmon=%d)", xmon)
         return

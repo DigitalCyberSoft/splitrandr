@@ -105,5 +105,5 @@ def apply_profile(name):
         xrandr = XRandR(force_version=True)
         xrandr.load_from_x()
         xrandr.load_from_json(path)
-        xrandr.save_to_x()
+        xrandr.save_to_x(reason="profile apply: %s" % name)
         set_active_profile(name)

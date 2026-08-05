@@ -18,6 +18,7 @@ the CLI entry points (``--apply``, ``--watch`` etc.) live in
 """
 
 import os
+import sys
 import optparse
 import logging
 
@@ -222,12 +223,91 @@ def _strip_own_preload():
     os.execv(sys.executable, argv)
 
 
+_logging_setup_done = False
+
+
+def _log_file_path():
+    state_home = os.environ.get('XDG_STATE_HOME') or os.path.join(
+        os.path.expanduser('~'), '.local', 'state')
+    return os.path.join(state_home, 'splitrandr', 'splitrandr.log')
+
+
+def _setup_logging():
+    """Log to stderr AND a timestamped rotating file.
+
+    stderr is not a reliable channel on this rig: autostarted instances
+    land in ~/.xsession-errors, GIO desktop launches (the Cinnamon menu)
+    get /dev/null, and root recovery runs get a tty that is gone by the
+    time anyone reads it. The file is the only post-mortem record that
+    survives every launch path -- the 2026-08-02 lock-screen incident was
+    diagnosable only through config file mtimes and the shim's own log
+    because the running watcher's stderr was /dev/null.
+    """
+    global _logging_setup_done
+    if _logging_setup_done:
+        return
+    _logging_setup_done = True
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setFormatter(logging.Formatter('%(name)s: %(message)s'))
+    root.addHandler(stderr_handler)
+
+    log_path = None
+    try:
+        from logging.handlers import RotatingFileHandler
+        log_path = _log_file_path()
+        os.makedirs(os.path.dirname(log_path), mode=0o700, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path, maxBytes=4 * 1024 * 1024, backupCount=3)
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        root.addHandler(file_handler)
+    except OSError as e:
+        print("splitrandr: file logging unavailable (%s); "
+              "continuing with stderr only" % e, file=sys.stderr)
+        log_path = None
+
+    logging.getLogger('splitrandr').info(
+        "splitrandr %s starting (pid=%d, argv=%r, log file: %s)",
+        __version__, os.getpid(), sys.argv,
+        log_path or 'unavailable, stderr only')
+
+
+def _install_excepthook():
+    """Log unhandled exceptions before the default hook runs.
+
+    abrt on this machine runs with ProcessUnpackaged=no and DESTROYS the
+    traceback for unpackaged scripts -- it ate two `splitrandr --apply`
+    crashes (2026-08-01 18:42, 2026-08-02 10:51) and the
+    cinnamon-screensaver death (2026-08-02 12:40), leaving only "Error in
+    sys.excepthook:" lines. This hook keeps our own copy in the log file,
+    then chains to the previous hook so abrt/stderr behavior is unchanged.
+    """
+    def _hook(exc_type, exc, tb):
+        if not issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            logging.getLogger('splitrandr').critical(
+                "unhandled exception; process is exiting",
+                exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+    import threading
+    def _thread_hook(args):
+        logging.getLogger('splitrandr').critical(
+            "unhandled exception in thread %r; process is exiting",
+            args.thread.name if args.thread else '?',
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+        threading.__excepthook__(args)
+    threading.excepthook = _thread_hook
+
+
 def main():
     _strip_own_preload()
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(name)s: %(message)s',
-    )
+    _setup_logging()
+    _install_excepthook()
 
     parser = optparse.OptionParser(
         description="Monitor Layout Editor with Virtual Monitor Splitting",
@@ -267,8 +347,33 @@ def main():
         help='Run headless, re-applying active profile on screen unlock or wake from suspend',
         action='store_true'
     )
+    parser.add_option(
+        '--nudge-repaint',
+        help='Force windows to redraw (fixes stale window contents after the '
+             'displays drop out and come back), then exit',
+        action='store_true'
+    )
+    parser.add_option(
+        '--nudge-mode',
+        help="How --nudge-repaint works: 'resize' (default) grows each window "
+             "and sets it back, forcing a new drawing surface; 'remap' bounces "
+             "each window off a spare desktop and back, geometry-neutral but "
+             "measured ineffective for stale surfaces; 'refresh' just sends "
+             "an xrefresh, which touches nothing but only helps if the client "
+             "merely needs an Expose",
+        choices=('resize', 'remap', 'refresh'), default='resize'
+    )
 
     (options, args) = parser.parse_args()
+
+    # Handled before the singleton lock: this only moves windows between
+    # desktops and never touches ~/.config/fakexrandr.bin, so it is safe to run
+    # while the GUI instance is up -- which is exactly when it is needed.
+    if options.nudge_repaint:
+        from . import window_layout
+        n = window_layout.nudge_repaint(mode=options.nudge_mode)
+        print("nudged %d windows (mode=%s)" % (n, options.nudge_mode))
+        return
 
     # Block any second splitrandr in this session. Two instances racing
     # on ~/.config/fakexrandr.bin is what kicked off the crash chain on

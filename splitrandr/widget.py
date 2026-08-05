@@ -460,8 +460,8 @@ class MonitorWidget(Gtk.DrawingArea):
         self.emit('changed')
         self.emit('selection-changed')
 
-    def save_to_x(self):
-        self._xrandr.save_to_x()
+    def save_to_x(self, reason=''):
+        self._xrandr.save_to_x(reason=reason)
         # load_from_x() now layers splits from cinnamon + layout.json
         # internally, so the trailing reload picks up the just-applied
         # state without any explicit re-merge here. Cinnamon's

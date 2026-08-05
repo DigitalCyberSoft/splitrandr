@@ -139,10 +139,31 @@ def _get_cinnamon_fakexrandr_path():
     return None
 
 
-def is_cinnamon_fakexrandr_current():
-    """Check if Cinnamon's loaded fakexrandr .so matches the on-disk version.
+def _process_start_epoch(pid):
+    """Wall-clock epoch when ``pid`` started; None when unreadable.
 
-    Returns True if versions match, False if mismatch or can't determine.
+    Used by the staleness checks: a process can never be running a .so
+    build that finished after it started, so disk-mtime vs process-start
+    is a sound "the running build is older" discriminator even when the
+    rebuild kept the inode.
+    """
+    import psutil
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied,
+            psutil.ZombieProcess):
+        return None
+
+
+def is_cinnamon_fakexrandr_current():
+    """Check if Cinnamon's loaded fakexrandr .so matches the on-disk build.
+
+    Returns True if the running build is current, False if stale or can't
+    determine. Three stale detectors, in order: the maps '(deleted)'
+    marker (file replaced by rename), the on-disk mtime vs Cinnamon's
+    start time (catches in-place `make` rebuilds, which keep the inode
+    and never show '(deleted)'), and the config-bin version as a last
+    resort.
     """
     loaded_path = _get_cinnamon_fakexrandr_path()
     if not loaded_path:
@@ -168,12 +189,32 @@ def is_cinnamon_fakexrandr_current():
     try:
         loaded_stat = os.stat(loaded_path)
         ondisk_stat = os.stat(ondisk_path)
-        if loaded_stat.st_dev == ondisk_stat.st_dev and loaded_stat.st_ino == ondisk_stat.st_ino:
-            return True
+        same_inode = (loaded_stat.st_dev == ondisk_stat.st_dev and
+                      loaded_stat.st_ino == ondisk_stat.st_ino)
     except OSError:
-        pass
+        same_inode = False
 
-    # Files differ (or stat failed) — compare config versions
+    if same_inode:
+        # Same inode is NOT proof of currency: `make` rewrites the .so in
+        # place, so the running process may hold a mapping of the same
+        # inode with OLD content, and no '(deleted)' marker ever appears.
+        # What an in-place rebuild cannot change is time: Cinnamon mapped
+        # before the build finished.
+        if pid:
+            start = _process_start_epoch(pid)
+            if start is not None:
+                try:
+                    if os.stat(ondisk_path).st_mtime > start + 5:
+                        log.info("fakexrandr .so on disk (mtime %.0f) is "
+                                 "newer than Cinnamon start (%.0f); the "
+                                 "running process does not have the new "
+                                 "build", os.stat(ondisk_path).st_mtime, start)
+                        return False
+                except OSError:
+                    pass
+        return True
+
+    # Files differ — compare config versions
     loaded_ver = _get_so_config_version(loaded_path)
     ondisk_ver = _get_so_config_version(ondisk_path)
     if loaded_ver != ondisk_ver:
@@ -259,7 +300,12 @@ def _screensaver_override_content(lib_path):
         "# lock screen sees the same virtual split monitors as muffin; without\n"
         "# it the screensaver's rects 'DO NOT add up' and it can wedge on\n"
         "# hotplug. Delete this file and reload dbus for the stock screensaver.\n"
-        "Exec=/usr/bin/env LD_PRELOAD=%s FAKEXRANDR_LOG=%s %s\n"
+        "# --debug sends the daemon's own reasoning (lock trigger, monitor\n"
+        "# changes, auth flow) to journald. It matters because the daemon is\n"
+        "# cinnamon-screensaver-main.py -- a Python program whose crash\n"
+        "# tracebacks abrt destroys (ProcessUnpackaged=no), exactly like\n"
+        "# splitrandr's own --apply crashes.\n"
+        "Exec=/usr/bin/env LD_PRELOAD=%s FAKEXRANDR_LOG=%s %s --debug\n"
         % (SCREENSAVER_DBUS_NAME, __name__, lib_path,
            SCREENSAVER_FAKEXRANDR_LOG, SCREENSAVER_EXEC)
     )
@@ -318,6 +364,84 @@ def write_screensaver_dbus_override(lib_path=None, activate=True):
     return True
 
 
+def screensaver_is_active():
+    """True if cinnamon-screensaver currently reports itself active (screen
+    blanked or locked). Returns None when the state cannot be determined.
+
+    Used to refuse a screensaver restart mid-lock: see
+    _activate_screensaver_override.
+    """
+    try:
+        out = subprocess.run(
+            ['dbus-send', '--session', '--print-reply',
+             '--dest=org.cinnamon.ScreenSaver', '/org/cinnamon/ScreenSaver',
+             'org.cinnamon.ScreenSaver.GetActive'],
+            capture_output=True, timeout=5)
+    except Exception as e:
+        log.warning("could not query screensaver state: %s", e)
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.decode('utf-8', 'replace')
+    m = re.search(r'boolean\s+(true|false)', text)
+    if not m:
+        return None
+    return m.group(1) == 'true'
+
+
+_CS_LOCKER_EXEC = '/usr/libexec/cinnamon-screensaver/cs-backup-locker'
+_CS_PAM_HELPER_EXEC = \
+    '/usr/libexec/cinnamon-screensaver/cinnamon-screensaver-pam-helper'
+_CS_MAIN_EXEC = '/usr/share/cinnamon-screensaver/cinnamon-screensaver-main.py'
+
+
+def reap_orphaned_lock_helpers():
+    """SIGTERM cs-backup-locker / pam-helper processes whose daemon is gone.
+
+    cinnamon-screensaver spawns cs-backup-locker (a bare black X grab with no
+    unlock UI) and cinnamon-screensaver-pam-helper. Neither exits when its
+    parent dies: the helper sits in auth_message_handler's usleep loop waiting
+    on a pipe whose write end is gone, and the locker keeps its grab. A dead
+    screensaver therefore leaves the screen grabbed black with no password
+    prompt -- the exact lockout this rig kept hitting (orphans observed
+    reparented to systemd --user, stuck for days; the two from the
+    2026-08-02 12:40 lock failure were still alive hours later).
+
+    A helper counts as orphaned exactly when its parent is not a running
+    cinnamon-screensaver, so this is safe to call at any time: legitimate
+    children of a live daemon are skipped. Matching is on argv[0] equality,
+    never a substring -- an unanchored `pkill -f` also matches any shell
+    whose argv mentions the path (it killed the invoking shell during
+    testing). Returns the reaped pids.
+    """
+    import psutil
+    reaped = []
+    for proc in psutil.process_iter(['pid', 'ppid', 'cmdline']):
+        argv = proc.info.get('cmdline') or []
+        if not argv or argv[0] not in (_CS_LOCKER_EXEC, _CS_PAM_HELPER_EXEC):
+            continue
+        ppid = proc.info.get('ppid') or 0
+        parent_is_daemon = False
+        if ppid > 0:
+            try:
+                parent_is_daemon = 'cinnamon-screen' in \
+                    (psutil.Process(ppid).name() or '')
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                parent_is_daemon = False
+        if parent_is_daemon:
+            continue
+        try:
+            os.kill(proc.info['pid'], 15)
+            reaped.append(proc.info['pid'])
+        except (ProcessLookupError, PermissionError) as e:
+            log.warning("could not reap %s (pid %d): %s",
+                        argv[0], proc.info['pid'], e)
+    if reaped:
+        log.info("reaped orphaned lock helper(s): pids %s", reaped)
+    return reaped
+
+
 def _activate_screensaver_override():
     """Reload the session bus service files and drop any running
     cinnamon-screensaver so the override takes effect on next activation."""
@@ -329,14 +453,45 @@ def _activate_screensaver_override():
             capture_output=True, timeout=5)
     except Exception as e:
         log.warning("dbus ReloadConfig failed: %s", e)
-    # Drop the running daemon so it re-activates with the preload. Match on
-    # the exact executable path so csd-screensaver-proxy and the
-    # cs-backup-locker helper (different argv) are left alone.
-    try:
-        subprocess.run(['pkill', '-f', '/cinnamon-screensaver$'],
-                       capture_output=True, timeout=5)
-    except Exception as e:
-        log.warning("could not restart cinnamon-screensaver: %s", e)
+
+    # NEVER restart the screensaver while it is active. Killing it mid-lock
+    # orphans the in-flight cinnamon-screensaver-pam-helper (it blocks forever
+    # in usleep, PAM then reports "conversation failed") and strands
+    # cs-backup-locker holding a black grab with no unlock UI -- the user is
+    # locked out with nothing to type into. The override is only needed by the
+    # *next* activation, and ReloadConfig above already staged it, so deferring
+    # costs nothing.
+    active = screensaver_is_active()
+    if active is not False:
+        log.info("screensaver active=%s; deferring restart so the lock screen "
+                 "is not orphaned (override applies on next activation)",
+                 active)
+        return
+
+    # Drop the running daemon so it re-activates with the preload. Match the
+    # interpreter running cinnamon-screensaver-main.py on argv[1]: the sh
+    # wrapper exec's main.py, so the live cmdline is
+    # "python3 /usr/share/cinnamon-screensaver/cinnamon-screensaver-main.py
+    # [--debug]". The pkill pattern this replaced ('/cinnamon-screensaver$')
+    # never matched that cmdline at all. argv[1] equality leaves
+    # csd-screensaver-proxy, the lock helpers, and any shell merely
+    # mentioning the path alone.
+    import psutil
+    for proc in psutil.process_iter(['pid', 'cmdline']):
+        argv = proc.info.get('cmdline') or []
+        if len(argv) < 2 or argv[1] != _CS_MAIN_EXEC:
+            continue
+        try:
+            os.kill(proc.info['pid'], 15)
+            log.info("stopped cinnamon-screensaver (pid %d) so the next "
+                     "activation picks up the override", proc.info['pid'])
+        except (ProcessLookupError, PermissionError) as e:
+            log.warning("could not stop cinnamon-screensaver (pid %d): %s",
+                        proc.info['pid'], e)
+
+    # The screensaver is gone; anything of its lock UI still running is an
+    # orphan that would grab the screen with no way to unlock it.
+    reap_orphaned_lock_helpers()
 
 
 # gsettings keys that gate cinnamon's automatic lock. Disabling these is the
@@ -352,19 +507,26 @@ _LOCK_GSETTINGS = (
 def disable_screensaver_lock():
     """Disable cinnamon's automatic screen lock while the split is active.
 
-    On this virtual-split rig the lock screen is broken: cinnamon-screensaver
-    cannot draw its real unlock UI over the split monitors, so it falls back to
-    cs-backup-locker -- a bare black grab with NO password prompt, which locks
-    the user out unrecoverably. This was verified 2026-07-14: even with the
-    fakexrandr screensaver override active and the screensaver seeing the same
-    6 monitors as muffin (rects agree), triggering a lock still spawned
-    cs-backup-locker. So the shim override (write_screensaver_dbus_override) is
-    necessary-but-insufficient; the lock itself must be disabled.
+    Historical context: on 2026-07-14 a lock still spawned cs-backup-locker --
+    a bare black grab with NO password prompt -- even with the fakexrandr
+    screensaver override active and the screensaver seeing the same 6 monitors
+    as muffin (rects agree). That was read as "the unlock UI cannot draw on
+    split monitors", so the lock was disabled outright.
 
-    Sets lock-enabled=false and idle-delay=0 so nothing auto-activates a lock.
-    Persists in the user's dconf; re-applied on every split apply so it can't
-    silently regress. Re-enable with `gsettings reset` on the same keys once the
-    lock-screen rendering bug is fixed upstream.
+    That reading is now doubtful. It predates the GTK-safe XRRGetMonitors
+    records (da1a33e), and the 2026-07-25 post-mortem found a sufficient
+    alternative cause for the same symptom: _activate_screensaver_override()
+    pkill'ed cinnamon-screensaver while it was active, orphaning the in-flight
+    pam-helper and stranding cs-backup-locker's grab. Whether the unlock UI is
+    independently broken has NOT been re-tested since that fix.
+
+    Sets lock-enabled=false, lock-delay=0 and idle-delay=0.
+
+    NOT called automatically any more -- leaving a logged-in session with no
+    automatic lock is a security regression, and the 2026-07-25 post-mortem
+    traced the lockouts to _activate_screensaver_override() killing the
+    screensaver mid-lock rather than to the lock itself. Kept as a manual
+    escape hatch. Undo with `gsettings reset` on the same keys.
     """
     for schema, key, value in _LOCK_GSETTINGS:
         try:
@@ -1047,6 +1209,34 @@ def nudge_gtk_monitor_refresh():
         return False
 
 
+# Keep the shim log useful for a post-mortem without letting it eat the disk.
+FAKEXRANDR_LOG_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _truncate_oversized_log(path, max_bytes=FAKEXRANDR_LOG_MAX_BYTES):
+    """Truncate ``path`` in place if it exceeds ``max_bytes``.
+
+    Truncate rather than unlink: the shim resolves the path once at
+    _fxr_log_init and holds the FILE*, so unlinking would send an already
+    running Cinnamon's output to a deleted inode. Nothing is renamed either --
+    only the current instance's entries matter for a post-mortem.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return  # absent or unreadable: nothing to trim
+    if size <= max_bytes:
+        return
+    try:
+        with open(path, 'r+b') as fh:
+            fh.truncate(0)
+    except OSError as e:
+        log.warning("could not truncate %s (%d bytes): %s", path, size, e)
+        return
+    log.info("truncated %s: was %.1f MB, cap is %.1f MB",
+             path, size / 1048576.0, max_bytes / 1048576.0)
+
+
 def restart_cinnamon_with_fakexrandr(lib_path=None):
     """Restart the shell (Cinnamon/GNOME) with fakexrandr LD_PRELOAD.
 
@@ -1062,13 +1252,19 @@ def restart_cinnamon_with_fakexrandr(lib_path=None):
 
     # Keep the lock screen in lockstep: give cinnamon-screensaver the same
     # fakexrandr preload path muffin is about to get, so it sees the split
-    # monitors instead of wedging when they change under a lock. (Necessary
-    # but NOT sufficient -- see disable_screensaver_lock below.)
+    # monitors instead of wedging when they change under a lock.
     write_screensaver_dbus_override(lib_path)
-    # The lock UI is broken on split monitors and falls back to the
-    # cs-backup-locker black grab (verified even when monitor rects agree), so
-    # the automatic lock must be disabled outright or it traps the user.
-    disable_screensaver_lock()
+    # NOTE: this used to call disable_screensaver_lock() on every apply. That
+    # is a security regression -- it leaves a logged-in session with no
+    # automatic lock at all -- and it was aimed at the wrong cause. The
+    # 2026-07-25 post-mortem showed the lockouts came from
+    # _activate_screensaver_override() pkill'ing cinnamon-screensaver while it
+    # was active: that orphaned cinnamon-screensaver-pam-helper (stuck in
+    # auth_message_handler's usleep, PAM reporting "conversation failed") and
+    # stranded cs-backup-locker holding a black grab with no unlock UI.
+    # _activate_screensaver_override() now refuses to restart while the
+    # screensaver is active and reaps orphans, so the lock can stay enabled.
+    # disable_screensaver_lock() is kept as a manual escape hatch only.
 
     env = os.environ.copy()
     existing = env.get('LD_PRELOAD', '')
@@ -1081,6 +1277,12 @@ def restart_cinnamon_with_fakexrandr(lib_path=None):
     # easy to locate; existing handlers in libXrandr.c open in append
     # mode, so multiple restarts share the file with timestamps.
     env.setdefault('FAKEXRANDR_LOG', '/tmp/fakexrandr.log')
+
+    # Append mode plus one FXLOG per XRRGetMonitors means the file only ever
+    # grows. On 2026-07-25 it reached 389 MB. Truncate at restart when it is
+    # over the cap: a post-mortem only ever needs the current instance, and
+    # libXrandr.c fopen()s with "a", so truncating between runs is safe.
+    _truncate_oversized_log(env['FAKEXRANDR_LOG'])
 
     # Reap any zombie cinnamon children from previous restarts
     _reap_children()

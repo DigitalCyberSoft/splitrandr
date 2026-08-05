@@ -173,10 +173,18 @@ class XRandRSaveMixin:
             self._log_tree("left", tree.left, indent + "  ")
             self._log_tree("right", tree.right, indent + "  ")
 
-    def save_to_x(self):
-        self.check_configuration()
+    def save_to_x(self, reason=''):
+        """Apply the configuration to the X server.
 
-        log.info("=== save_to_x: starting ===")
+        ``reason`` names who asked for this apply (gui apply, watcher
+        degraded apply, cli --apply, profile apply) and is logged at
+        entry: post-mortems need to distinguish watcher-triggered applies
+        from manual ones, and config file mtimes alone only prove that a
+        write happened.
+        """
+        log.info("=== save_to_x: starting (reason: %s) ===",
+                 reason or 'unspecified')
+        self.check_configuration()
         log.info("splits to apply: %s", list(self.configuration.splits.keys()))
         for name, tree in self.configuration.splits.items():
             self._log_tree(name, tree)
@@ -525,13 +533,56 @@ class XRandRSaveMixin:
         # layoutManager handlers and the JS code SIGSEGVs in
         # meta_display_logical_index_to_xinerama_index().
 
+        # Muffin can come out of a full output drop WEDGED: both
+        # outputs back, xrandr state verified correct, setmonitor VMs
+        # registered — and its logical monitor list still empty,
+        # because setmonitor writes are protocol-silent and the earlier
+        # drop is the last thing it processed. Observed 2026-08-05
+        # 16:29: meta_monitor_manager_get_logical_monitor_from_number
+        # asserted, "Monitor 0 not found. Not creating panel", desktop
+        # unusable until a manual shell restart. The bin-hash restart
+        # gate above cannot catch this (the re-applied bin is byte-
+        # identical, so bin_changed=False); only asking the shell what
+        # it believes can. Restart it with the shim when it reports an
+        # empty list.
+        try:
+            from .cinnamon_compat import cinnamon_shell_health
+            health = self.configuration.splits and cinnamon_shell_health()
+            if health and health.get('monitors', -1) == 0:
+                log.warning("cinnamon reports ZERO logical monitors after "
+                            "apply (wedged by the output drop) -- "
+                            "restarting the shell to recover")
+                from .fakexrandr_config import (
+                    _find_fakexrandr_lib, restart_cinnamon_with_fakexrandr,
+                )
+                lib_path = _find_fakexrandr_lib()
+                if lib_path:
+                    restart_cinnamon_with_fakexrandr(lib_path)
+                    from .cinnamon_compat import _wait_cinnamon_on_dbus
+                    if not _wait_cinnamon_on_dbus(timeout=15.0):
+                        log.warning("Cinnamon did not come back on D-Bus "
+                                    "after wedge-recovery restart")
+                    else:
+                        log.info("Cinnamon recovered from monitor-list "
+                                 "wedge")
+            elif health and health.get('panels', -1) == 0:
+                log.warning("cinnamon reports %d monitors but ZERO panels "
+                            "after apply -- panels-enabled may point at a "
+                            "monitor index that did not exist during a "
+                            "wedge; pin_panels_to_primary below should "
+                            "correct it", health.get('monitors'))
+        except Exception as e:
+            log.warning("cinnamon wedge check failed: %s", e, exc_info=True)
+
         # Pin Cinnamon's panel(s) to the primary monitor's xinerama
         # index. The panels-enabled gsetting is xinerama-indexed but
         # the rest of Cinnamon's APIs use logical indexing; on Nvidia
         # tiled hardware the two orderings differ, so a hard-coded
         # gsetting can land the panel on the wrong tile. Done last so
         # that Cinnamon has had a chance to settle its primary state
-        # after all the prior xrandr / restart activity.
+        # after all the prior xrandr / restart activity (including the
+        # wedge-recovery restart above, whose fresh shell must be the
+        # one whose primary index gets written back).
         try:
             from .cinnamon_compat import pin_panels_to_primary
             pin_panels_to_primary()
@@ -558,6 +609,16 @@ class XRandRSaveMixin:
     def load_from_json(self, path):
         with open(path, 'r') as f:
             data = json.load(f)
+        self.load_from_dict(data)
+
+    def load_from_dict(self, data):
+        """Merge a layout dict (profile-JSON shape) onto current live state.
+
+        Split out of load_from_json so the watcher can apply a derived
+        layout (the active profile minus missing outputs, see
+        presence.degrade_profile_data) without writing it to disk first
+        -- the degraded layout must never be persisted.
+        """
         # Merge saved config onto current live state
         saved_cfg = self.Configuration.from_dict(data, self)
         for name, saved_out in saved_cfg.outputs.items():

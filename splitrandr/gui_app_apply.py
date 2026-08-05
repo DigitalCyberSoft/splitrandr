@@ -345,7 +345,7 @@ class ApplicationApplyMixin:
                 )
 
         try:
-            self.widget.save_to_x()
+            self.widget.save_to_x(reason='gui apply')
         except Exception as exc:
             dialog = Gtk.MessageDialog(
                 None, Gtk.DialogFlags.MODAL, Gtk.MessageType.ERROR,
@@ -454,7 +454,7 @@ class ApplicationApplyMixin:
                 )
 
         try:
-            self.widget.save_to_x()
+            self.widget.save_to_x(reason='gui apply+autostart')
         except Exception as exc:
             dialog = Gtk.MessageDialog(
                 None, Gtk.DialogFlags.MODAL, Gtk.MessageType.ERROR,

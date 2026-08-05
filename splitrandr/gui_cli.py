@@ -16,9 +16,13 @@ fresh :class:`XRandR` and operate on disk + X server state directly.
 """
 
 import os
+import sys
 
 import gi
 gi.require_version('Gtk', '3.0')
+# Pinned for the same reason as in gui_screen_watcher: Gdk is imported without
+# Gtk in the statement, so it resolves first and PyGI warns about Gdk 4.0.
+gi.require_version('Gdk', '3.0')
 from gi.repository import Gdk, GLib
 
 from . import profiles
@@ -75,6 +79,32 @@ def _apply_config(json_path):
     """Load layout from JSON and apply via save_to_x()."""
     from .xrandr import XRandR
 
+    if os.geteuid() == 0:
+        # save_to_x rewrites ~/.config/fakexrandr.bin and
+        # ~/.config/cinnamon-monitors.xml via tmp+rename; as root those
+        # come out root-owned and the session user's next apply fails on
+        # permissions. Refusing beats diagnosing a permission error later.
+        home = os.path.expanduser('~')
+        try:
+            home_uid = os.stat(home).st_uid
+        except OSError:
+            home_uid = 0
+        if home_uid != 0:
+            import pwd
+            owner = pwd.getpwuid(home_uid).pw_name
+            print(
+                "Error: refusing to apply as root with HOME=%s (owned by "
+                "%s): the rewritten config files would end up root-owned.\n"
+                "Run as the session user instead:\n"
+                "  sudo -u %s env HOME=%s DISPLAY=%s "
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%d/bus "
+                "XDG_RUNTIME_DIR=/run/user/%d "
+                "python3 -m splitrandr --apply"
+                % (home, owner, owner, home,
+                   os.environ.get('DISPLAY', ':0'), home_uid, home_uid),
+                file=sys.stderr)
+            sys.exit(2)
+
     if not os.path.exists(json_path):
         print("Error: config file not found: %s" % json_path)
         return
@@ -82,7 +112,7 @@ def _apply_config(json_path):
     xrandr = XRandR(force_version=True)
     xrandr.load_from_x()
     xrandr.load_from_json(json_path)
-    xrandr.save_to_x()
+    xrandr.save_to_x(reason='cli --apply')
     print("Applied config from %s" % json_path)
 
 

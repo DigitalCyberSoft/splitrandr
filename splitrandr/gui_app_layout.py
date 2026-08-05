@@ -26,6 +26,8 @@ stable interface for ``gui_app_controls``.
 """
 
 import logging
+import os
+import time
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -312,6 +314,22 @@ class ApplicationLayoutMixin:
 
         page.pack_start(self._controls_box, False, False, 0)
 
+        # Shim status strip — always-visible, unlike the problems-only
+        # InfoBar above: this is the positive "loaded and current" state
+        # (the pre-0.5.0 colored-dot label, carried across the redesign),
+        # and it is also how a stale .so becomes visible: a rebuild on
+        # disk is not picked up until Cinnamon restarts, and the 3s poll
+        # below flags the mismatch.
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        status_row.set_margin_start(18)
+        status_row.set_margin_end(18)
+        status_row.set_margin_top(2)
+        status_row.set_margin_bottom(8)
+        self._fxr_status_label = Gtk.Label()
+        self._fxr_status_label.set_halign(Gtk.Align.END)
+        status_row.pack_start(self._fxr_status_label, True, True, 0)
+        page.pack_start(status_row, False, False, 0)
+
         self._refresh_fxr_status()
         GLib.timeout_add_seconds(3, self._refresh_fxr_status_periodic)
 
@@ -454,16 +472,22 @@ class ApplicationLayoutMixin:
             self._reload_cinnamon_ui()
 
     def _refresh_fxr_status(self):
-        """Poll libXrandr.so state and drive the problems-only InfoBar."""
+        """Poll libXrandr.so state: always-visible dot label + InfoBar."""
         from .fakexrandr_config import (
             is_cinnamon_fakexrandr_current,
             _get_cinnamon_fakexrandr_path,
+            _get_cinnamon_pid,
             _get_so_config_version,
             _find_fakexrandr_lib,
+            _process_start_epoch,
         )
 
         state = 'ok'
         message = ''
+        ondisk_ver = 0
+        loaded_ver = 0
+        disk_time = ''
+        start_time = ''
         # Boundary containment: this runs on a 3s UI timer and the
         # helpers probe /proc, which can race process exits. A failed
         # poll must not take down the GUI; it reports as 'unknown' and
@@ -472,6 +496,9 @@ class ApplicationLayoutMixin:
             loaded_path = _get_cinnamon_fakexrandr_path()
             ondisk_path = _find_fakexrandr_lib()
             ondisk_ver = _get_so_config_version(ondisk_path) if ondisk_path else 0
+            if ondisk_path:
+                disk_time = time.strftime(
+                    '%H:%M', time.localtime(os.path.getmtime(ondisk_path)))
             if not loaded_path:
                 state = 'missing'
                 message = _(
@@ -480,14 +507,60 @@ class ApplicationLayoutMixin:
             elif not is_cinnamon_fakexrandr_current():
                 loaded_ver = _get_so_config_version(loaded_path)
                 state = 'stale'
+                pid = _get_cinnamon_pid()
+                if pid:
+                    start = _process_start_epoch(pid)
+                    if start is not None:
+                        start_time = time.strftime(
+                            '%H:%M', time.localtime(start))
                 message = _(
-                    "libXrandr v%d is loaded in Cinnamon, but v%d is on "
-                    "disk.") % (loaded_ver, ondisk_ver)
+                    "libXrandr v%d is loaded in Cinnamon, but the on-disk "
+                    "build (built %s) is newer than Cinnamon started (%s). "
+                    "Reload Cinnamon to pick it up.") % (
+                        loaded_ver, disk_time or '?', start_time or '?')
+            else:
+                loaded_ver = _get_so_config_version(
+                    loaded_path) if loaded_path else ondisk_ver
         except Exception as exc:
             log.debug("libXrandr status poll failed: %s", exc)
             state = 'unknown'
 
+        self._update_shim_status_label(state, loaded_ver, ondisk_ver,
+                                       disk_time, start_time)
         self._update_status_infobar(state, message)
+
+    def _update_shim_status_label(self, state, loaded_ver, ondisk_ver,
+                                  disk_time, start_time):
+        """Always-visible colored-dot indicator for the shim's load state.
+
+        The pre-0.5.0 label carried across the redesign: green = loaded
+        and current, yellow = loaded but the disk build is newer (needs a
+        Cinnamon reload), red = not loaded in Cinnamon, gray = unreadable.
+        """
+        if not hasattr(self, '_fxr_status_label'):
+            return
+        if state == 'ok':
+            markup = (
+                '<span foreground="#3ca64a">●</span> '
+                '<span size="small">libXrandr.so <b>v%d loaded</b></span>'
+                % loaded_ver)
+        elif state == 'stale':
+            markup = (
+                '<span foreground="#e6a949">●</span> '
+                '<span size="small">libXrandr.so v%d loaded '
+                '<b>(outdated</b> — disk rebuilt %s, Cinnamon started '
+                '%s<b>)</b></span>'
+                % (loaded_ver, disk_time or '?', start_time or '?'))
+        elif state == 'missing':
+            markup = (
+                '<span foreground="#e64949">●</span> '
+                '<span size="small">libXrandr.so <b>not loaded</b> in '
+                'Cinnamon (v%d on disk)</span>' % ondisk_ver)
+        else:
+            markup = (
+                '<span foreground="#888888">●</span> '
+                '<span size="small">libXrandr.so status unknown</span>')
+        self._fxr_status_label.set_markup(markup)
 
     def _update_status_infobar(self, state, message):
         suppressed = self._apply_in_flight or self._reload_in_flight
