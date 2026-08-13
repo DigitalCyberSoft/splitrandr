@@ -543,28 +543,28 @@ class XRandRSaveMixin:
         # unusable until a manual shell restart. The bin-hash restart
         # gate above cannot catch this (the re-applied bin is byte-
         # identical, so bin_changed=False); only asking the shell what
-        # it believes can. Restart it with the shim when it reports an
-        # empty list.
+        # it believes can.
+        #
+        # Recovery runs in a DEDICATED detached process, never inline:
+        # the WM swap it performs can SEGV this very process when it is
+        # the GTK watcher (that killed the watcher on 2026-08-06), and
+        # an inline spawn-and-poll cannot verify anything — the old
+        # wedged shell keeps answering on org.Cinnamon, which is how
+        # the previous inline version logged "recovered" in 5ms while
+        # the shell still had zero monitors.
         try:
             from .cinnamon_compat import cinnamon_shell_health
             health = self.configuration.splits and cinnamon_shell_health()
             if health and health.get('monitors', -1) == 0:
                 log.warning("cinnamon reports ZERO logical monitors after "
-                            "apply (wedged by the output drop) -- "
-                            "restarting the shell to recover")
-                from .fakexrandr_config import (
-                    _find_fakexrandr_lib, restart_cinnamon_with_fakexrandr,
-                )
-                lib_path = _find_fakexrandr_lib()
-                if lib_path:
-                    restart_cinnamon_with_fakexrandr(lib_path)
-                    from .cinnamon_compat import _wait_cinnamon_on_dbus
-                    if not _wait_cinnamon_on_dbus(timeout=15.0):
-                        log.warning("Cinnamon did not come back on D-Bus "
-                                    "after wedge-recovery restart")
-                    else:
-                        log.info("Cinnamon recovered from monitor-list "
-                                 "wedge")
+                            "apply (wedged by the output drop)")
+                if os.environ.get('SPLITRANDR_IN_RECOVERY'):
+                    log.warning("already inside shell recovery; leaving the "
+                                "wedge for the recovery sequence to resolve")
+                else:
+                    from .shell_recovery import spawn_recovery
+                    spawn_recovery(reason='save_to_x wedge check (%s)'
+                                          % (reason or 'apply'))
             elif health and health.get('panels', -1) == 0:
                 log.warning("cinnamon reports %d monitors but ZERO panels "
                             "after apply -- panels-enabled may point at a "

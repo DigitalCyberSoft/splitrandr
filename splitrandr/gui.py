@@ -363,6 +363,29 @@ def main():
              "merely needs an Expose",
         choices=('resize', 'remap', 'refresh'), default='resize'
     )
+    parser.add_option(
+        '--recover-shell',
+        help='Recover a wedged compositor after a display power loss: '
+             'deactivate a trapped lock screen, restart the shell with the '
+             'fakexrandr shim (shielding terminals from the WM swap), verify '
+             'it reports monitors again, rebuild the split tiles, and force '
+             'a repaint. Safe to run any time: exits immediately when the '
+             'shell is healthy',
+        action='store_true'
+    )
+    parser.add_option(
+        '--sentinel',
+        help='One health check: recover the shell if it is wedged and '
+             'relaunch the watcher if it is missing. Meant to be run by the '
+             'systemd user timer (see --install-sentinel)',
+        action='store_true'
+    )
+    parser.add_option(
+        '--install-sentinel',
+        help='Install and enable a systemd --user timer running --sentinel '
+             'every minute',
+        action='store_true'
+    )
 
     (options, args) = parser.parse_args()
 
@@ -373,6 +396,29 @@ def main():
         from . import window_layout
         n = window_layout.nudge_repaint(mode=options.nudge_mode)
         print("nudged %d windows (mode=%s)" % (n, options.nudge_mode))
+        return
+
+    # Also pre-lock: recovery and the sentinel must run while the GUI
+    # instance holds the singleton lock -- the GUI may be SIGSTOPped or
+    # wedged along with the shell, which is exactly when these are
+    # needed. They serialize against each other on their own recovery
+    # lock instead, and never write ~/.config/fakexrandr.bin outside a
+    # recovery (where the only other writer is frozen by the shield).
+    if options.recover_shell:
+        from .shell_recovery import recover
+        auto = bool(os.environ.get('SPLITRANDR_AUTO_RECOVERY'))
+        verdict = recover(auto=auto, reason='cli --recover-shell')
+        print("shell recovery: %s" % verdict)
+        return
+
+    if options.sentinel:
+        from .shell_recovery import sentinel
+        sentinel()
+        return
+
+    if options.install_sentinel:
+        from .shell_recovery import install_sentinel
+        install_sentinel()
         return
 
     # Block any second splitrandr in this session. Two instances racing
