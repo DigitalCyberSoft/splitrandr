@@ -785,12 +785,17 @@ WantedBy=timers.target
 """
 
 
-def install_sentinel():
-    """Write and enable the systemd --user sentinel timer."""
-    unit_dir = os.path.join(
+def _unit_dir():
+    return os.path.join(
         os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
         'systemd', 'user')
-    os.makedirs(unit_dir, exist_ok=True)
+
+
+def _render_units():
+    """The unit texts install_sentinel would write RIGHT NOW. Shared with
+    sentinel_status so an on-disk unit written by an older version (or a
+    different python/package path) reads as outdated, exactly like the
+    shim's disk-newer-than-process staleness check."""
     pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env_line = ''
     if ('site-packages' not in pkg_parent
@@ -799,19 +804,107 @@ def install_sentinel():
     service = _SERVICE_UNIT.format(
         env=env_line,
         exec_start='%s -m splitrandr --sentinel' % sys.executable)
-    with open(os.path.join(unit_dir, 'splitrandr-sentinel.service'),
-              'w') as f:
-        f.write(service)
-    with open(os.path.join(unit_dir, 'splitrandr-sentinel.timer'), 'w') as f:
-        f.write(_TIMER_UNIT)
+    return service, _TIMER_UNIT
+
+
+def _systemctl_show(unit, props):
+    """Parse ``systemctl --user show`` key=value output, or None when
+    systemd --user isn't reachable from this process."""
+    try:
+        out = subprocess.run(
+            ['systemctl', '--user', 'show', unit,
+             '--property', ','.join(props)],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    parsed = {}
+    for line in out.stdout.splitlines():
+        if '=' in line:
+            k, v = line.split('=', 1)
+            parsed[k] = v
+    return parsed
+
+
+def sentinel_status():
+    """Everything the GUI needs to show sentinel state.
+
+    Returns a dict:
+      supported   -- systemd --user answered at all
+      installed   -- both unit files exist
+      current     -- on-disk units match what install would write now
+      enabled     -- timer unit-file state is enabled
+      active      -- timer is actively scheduling
+      last_run    -- human timestamp of the last trigger, or None
+      next_run    -- human timestamp of the next trigger, or None
+      last_result -- the service's systemd Result (e.g. 'success'), or None
+    """
+    st = {'supported': True, 'installed': False, 'current': False,
+          'enabled': False, 'active': False,
+          'last_run': None, 'next_run': None, 'last_result': None}
+    unit_dir = _unit_dir()
+    try:
+        with open(os.path.join(unit_dir,
+                               'splitrandr-sentinel.service')) as f:
+            on_disk_service = f.read()
+        with open(os.path.join(unit_dir, 'splitrandr-sentinel.timer')) as f:
+            on_disk_timer = f.read()
+        st['installed'] = True
+        want_service, want_timer = _render_units()
+        st['current'] = (on_disk_service == want_service
+                         and on_disk_timer == want_timer)
+    except OSError:
+        pass
+
+    props = _systemctl_show('splitrandr-sentinel.timer',
+                            ['LoadState', 'ActiveState', 'UnitFileState',
+                             'NextElapseUSecRealtime', 'LastTriggerUSec'])
+    if props is None:
+        st['supported'] = False
+        return st
+    if props.get('LoadState') == 'loaded':
+        st['enabled'] = props.get('UnitFileState') in (
+            'enabled', 'enabled-runtime', 'static')
+        st['active'] = props.get('ActiveState') == 'active'
+        for key, prop in (('next_run', 'NextElapseUSecRealtime'),
+                          ('last_run', 'LastTriggerUSec')):
+            val = props.get(prop, '')
+            st[key] = val if val and val != 'n/a' else None
+    sprops = _systemctl_show('splitrandr-sentinel.service', ['Result'])
+    if sprops and sprops.get('Result'):
+        st['last_result'] = sprops['Result']
+    return st
+
+
+def install_sentinel():
+    """Write and enable the systemd --user sentinel timer. Returns
+    ``(ok, message)``; also the remedy for an outdated or inactive
+    sentinel (rewrite + daemon-reload + enable --now covers all three)."""
+    unit_dir = _unit_dir()
+    try:
+        os.makedirs(unit_dir, exist_ok=True)
+        service, timer = _render_units()
+        with open(os.path.join(unit_dir,
+                               'splitrandr-sentinel.service'), 'w') as f:
+            f.write(service)
+        with open(os.path.join(unit_dir,
+                               'splitrandr-sentinel.timer'), 'w') as f:
+            f.write(timer)
+    except OSError as e:
+        return False, "could not write sentinel units: %s" % e
     for cmd in (['systemctl', '--user', 'daemon-reload'],
                 ['systemctl', '--user', 'enable', '--now',
                  'splitrandr-sentinel.timer']):
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, "%s failed: %s" % (' '.join(cmd), e)
         if result.returncode != 0:
-            print("warning: %s failed: %s" % (' '.join(cmd),
-                                              result.stderr.strip()))
-            return False
-    print("sentinel installed: %s/splitrandr-sentinel.{service,timer} "
-          "(runs every 60s)" % unit_dir)
-    return True
+            return False, "%s failed: %s" % (' '.join(cmd),
+                                             result.stderr.strip())
+    msg = ("sentinel installed: %s/splitrandr-sentinel.{service,timer} "
+           "(runs every 60s)" % unit_dir)
+    log.info(msg)
+    return True, msg

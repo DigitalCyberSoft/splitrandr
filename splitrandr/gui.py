@@ -418,7 +418,10 @@ def main():
 
     if options.install_sentinel:
         from .shell_recovery import install_sentinel
-        install_sentinel()
+        ok, msg = install_sentinel()
+        print(msg)
+        if not ok:
+            sys.exit(1)
         return
 
     # Block any second splitrandr in this session. Two instances racing

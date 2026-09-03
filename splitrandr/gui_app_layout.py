@@ -27,6 +27,8 @@ stable interface for ``gui_app_controls``.
 
 import logging
 import os
+import re
+import threading
 import time
 
 import gi
@@ -325,12 +327,29 @@ class ApplicationLayoutMixin:
         status_row.set_margin_end(18)
         status_row.set_margin_top(2)
         status_row.set_margin_bottom(8)
+        # Left side: the wedge-recovery sentinel (systemd --user timer).
+        # Its absence is invisible failure -- the 2026-08-09/-12 outages
+        # went unrecovered because the watcher was dead and nothing was
+        # checking -- so its state gets the same always-visible treatment
+        # as the shim, with the install/repair action right next to it.
+        self._sentinel_status_label = Gtk.Label()
+        self._sentinel_status_label.set_halign(Gtk.Align.START)
+        status_row.pack_start(self._sentinel_status_label, False, False, 0)
+        self._sentinel_action_btn = Gtk.Button()
+        self._sentinel_action_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self._sentinel_action_btn.set_no_show_all(True)
+        self._sentinel_action_btn.connect(
+            'clicked', self._on_sentinel_action)
+        status_row.pack_start(self._sentinel_action_btn, False, False, 6)
         self._fxr_status_label = Gtk.Label()
         self._fxr_status_label.set_halign(Gtk.Align.END)
         status_row.pack_start(self._fxr_status_label, True, True, 0)
         page.pack_start(status_row, False, False, 0)
 
+        self._sentinel_tick = 0
+        self._sentinel_busy = False
         self._refresh_fxr_status()
+        self._refresh_sentinel_status()
         GLib.timeout_add_seconds(3, self._refresh_fxr_status_periodic)
 
         return page
@@ -584,4 +603,116 @@ class ApplicationLayoutMixin:
     def _refresh_fxr_status_periodic(self):
         """GLib timeout callback — returns True to keep the timer alive."""
         self._refresh_fxr_status()
+        # Sentinel state changes rarely and its poll shells out to
+        # systemctl, so it rides every 5th tick (~15s).
+        self._sentinel_tick += 1
+        if self._sentinel_tick % 5 == 0:
+            self._refresh_sentinel_status()
         return True
+
+    #################### sentinel status + install ####################
+
+    def _refresh_sentinel_status(self):
+        if self._sentinel_busy:
+            return
+        try:
+            from .shell_recovery import sentinel_status
+            st = sentinel_status()
+        except Exception as exc:
+            log.debug("sentinel status poll failed: %s", exc)
+            st = None
+        self._update_sentinel_status_label(st)
+
+    @staticmethod
+    def _hhmm(systemd_timestamp):
+        """'Fri 2026-08-14 01:32:59 PST' → '01:32' (or None)."""
+        if not systemd_timestamp:
+            return None
+        m = re.search(r'(\d{1,2}:\d{2}):\d{2}', systemd_timestamp)
+        return m.group(1) if m else None
+
+    def _update_sentinel_status_label(self, st):
+        """Same colored-dot language as the shim indicator: green =
+        installed+ticking, yellow = needs an action (not installed /
+        outdated units / last run failed), red = installed but not
+        running, gray = unknowable."""
+        label = self._sentinel_status_label
+        btn = self._sentinel_action_btn
+        action = None
+
+        if st is None or not st['supported']:
+            markup = ('<span foreground="#888888">●</span> '
+                      '<span size="small">sentinel unavailable '
+                      '(systemd --user not reachable)</span>')
+        elif not st['installed']:
+            markup = ('<span foreground="#e6a949">●</span> '
+                      '<span size="small">recovery sentinel '
+                      '<b>not installed</b></span>')
+            action = _("Install Sentinel")
+        elif not st['current']:
+            markup = ('<span foreground="#e6a949">●</span> '
+                      '<span size="small">recovery sentinel '
+                      '<b>outdated</b> (units differ from this '
+                      'version)</span>')
+            action = _("Reinstall")
+        elif not st['active']:
+            markup = ('<span foreground="#e64949">●</span> '
+                      '<span size="small">recovery sentinel installed '
+                      'but <b>not running</b></span>')
+            action = _("Enable")
+        elif st['last_result'] not in (None, 'success'):
+            markup = ('<span foreground="#e6a949">●</span> '
+                      '<span size="small">sentinel active but last run '
+                      '<b>failed</b> (%s)</span>' % st['last_result'])
+        else:
+            last = self._hhmm(st['last_run'])
+            detail = ('last check %s' % last) if last \
+                else 'first check pending'
+            markup = ('<span foreground="#3ca64a">●</span> '
+                      '<span size="small">recovery sentinel <b>active</b>'
+                      ' — %s</span>' % detail)
+
+        label.set_markup(markup)
+        if action:
+            btn.set_label(action)
+            btn.show()
+        else:
+            btn.hide()
+
+    def _on_sentinel_action(self, _btn):
+        """Install / reinstall / enable — install_sentinel() covers all
+        three (rewrite units + daemon-reload + enable --now). Runs in a
+        thread: daemon-reload can take a second or two and the strip
+        must not freeze the GUI."""
+        if self._sentinel_busy:
+            return
+        self._sentinel_busy = True
+        self._sentinel_action_btn.hide()
+        self._sentinel_status_label.set_markup(
+            '<span foreground="#888888">●</span> '
+            '<span size="small">installing sentinel…</span>')
+
+        def worker():
+            try:
+                from .shell_recovery import install_sentinel
+                ok, msg = install_sentinel()
+            except Exception as exc:
+                ok, msg = False, str(exc)
+            GLib.idle_add(done, ok, msg)
+
+        def done(ok, msg):
+            self._sentinel_busy = False
+            self._sentinel_status_label.set_tooltip_text(msg)
+            if ok:
+                self._refresh_sentinel_status()
+            else:
+                # Leave the failure visible (tooltip carries the detail);
+                # the 15s periodic poll takes over from here.
+                log.warning("sentinel install failed: %s", msg)
+                self._sentinel_status_label.set_markup(
+                    '<span foreground="#e64949">●</span> '
+                    '<span size="small">sentinel install '
+                    '<b>failed</b></span>')
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
