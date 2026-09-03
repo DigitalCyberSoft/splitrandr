@@ -9,6 +9,7 @@ the Free Software Foundation, either version 3 of the License, or
 """
 
 import math
+import re
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -194,6 +195,9 @@ class MonitorWidget(Gtk.DrawingArea):
         self._theme_colors = _get_theme_colors()
         self._screenshots = {}
         self._monitors = []
+        # Connected-but-inactive outputs, drawn as dashed half-size tiles
+        # docked beside the layout so they stay visible and selectable.
+        self._ghosts = []
         self._is_cinnamon = False
 
         self.set_size_request(
@@ -277,15 +281,91 @@ class MonitorWidget(Gtk.DrawingArea):
                 'splits': cfg.splits.get(name) if self._show_splits else None,
                 'border': cfg.borders.get(name, 0) if self._show_splits else 0,
             })
+        self._sync_ghosts()
+
+    def _sync_ghosts(self):
+        """Build _ghosts: outputs that are connected but not active.
+
+        An output turned off in the profile (a laptop's internal panel
+        with an external monitor) used to vanish from every pane, and
+        since the Active switch lives on the SELECTED output there was no
+        way to select it and turn it back on short of ARandR's
+        right-click-on-empty-canvas menu. Ghosts are drawn at half size
+        in a dock beside the active layout (to the right for landscape
+        layouts, below for portrait) so they never overlap real
+        geometry and only modestly enlarge the fitted canvas.
+        """
+        self._ghosts = []
+        cfg = self._xrandr.configuration
+        state = getattr(self._xrandr, 'state', None)
+        if state is None or not getattr(state, 'outputs', None):
+            return
+        names = [n for n in sorted(cfg.outputs)
+                 if not cfg.outputs[n].active
+                 and n in state.outputs and state.outputs[n].connected]
+        if not names:
+            return
+        if self._monitors:
+            max_x = max(m['x'] + m['w'] for m in self._monitors)
+            max_y = max(m['y'] + m['h'] for m in self._monitors)
+        else:
+            max_x = max_y = 0
+        gap = max(int(max(max_x, max_y) * 0.04), 40)
+        right_dock = max_x >= max_y
+        cx = max_x + gap if right_dock else 0
+        cy = 0 if right_dock else max_y + gap
+        for name in names:
+            out = state.outputs[name]
+            size = out.preferred_resolution
+            if not size and out.modes:
+                size = (out.modes[0].width, out.modes[0].height)
+            if not size:
+                size = (1920, 1080)
+            w, h = max(int(size[0] / 2), 1), max(int(size[1] / 2), 1)
+            self._ghosts.append({'name': name, 'x': cx, 'y': cy,
+                                 'w': w, 'h': h})
+            if right_dock:
+                cy += h + gap
+            else:
+                cx += w + gap
+
+    def _ghost_at(self, x, y):
+        """Name of the ghost tile at widget coords, or None."""
+        x, y = x * self.factor, y * self.factor
+        for g in reversed(self._ghosts):
+            if g['x'] <= x <= g['x'] + g['w'] and g['y'] <= y <= g['y'] + g['h']:
+                return g['name']
+        return None
+
+    def _real_monitor_names(self):
+        """``{(x, y, w, h): name}`` from ``xrandr --listmonitors`` (shim
+        stripped by _output). The compositor only knows its monitors by
+        EDID product name -- 'Unknown 21"' twice on this hardware -- so
+        the Current pane labels them by matching geometry to the real
+        connector / virtual-monitor names instead."""
+        try:
+            out = self._xrandr._output('--listmonitors')
+        except Exception:
+            return {}
+        names = {}
+        for line in out.splitlines():
+            mt = re.match(
+                r'\s*\d+:\s+[+*]*(\S+)\s+(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)',
+                line)
+            if mt:
+                name, w, h, x, y = mt.groups()
+                names[(int(x), int(y), int(w), int(h))] = name
+        return names
 
     def _content_extent(self):
         """Virtual-pixel size of the drawn content, with a 5% margin."""
-        max_x = max(m['x'] + m['w'] for m in self._monitors)
-        max_y = max(m['y'] + m['h'] for m in self._monitors)
+        rects = self._monitors + self._ghosts
+        max_x = max(m['x'] + m['w'] for m in rects)
+        max_y = max(m['y'] + m['h'] for m in rects)
         return int(max_x * 1.05), int(max_y * 1.05)
 
     def _update_size_request(self):
-        if not self._monitors:
+        if not self._monitors and not self._ghosts:
             self.set_size_request(128, 96)
             return
         cw, ch = self._content_extent()
@@ -399,11 +479,13 @@ class MonitorWidget(Gtk.DrawingArea):
         # Validate selection: accept either a physical name or a virtual
         # name whose parent is still active and split.
         active_names = [m['name'] for m in self._monitors]
+        ghost_names = [g['name'] for g in self._ghosts]
         sel = self._selected_output
         valid = False
         if sel:
             phys, leaf_idx = self.parse_virtual_name(sel)
-            if leaf_idx is None and sel in active_names:
+            if leaf_idx is None and (sel in active_names
+                                     or sel in ghost_names):
                 valid = True
             elif leaf_idx is not None and phys in active_names:
                 tree = self._xrandr.configuration.splits.get(phys)
@@ -438,9 +520,11 @@ class MonitorWidget(Gtk.DrawingArea):
 
         self._is_cinnamon = True
         self._monitors = []
+        real_names = self._real_monitor_names()
         for m in monitors:
+            geom = (m['x'], m['y'], m['width'], m['height'])
             self._monitors.append({
-                'name': m['name'],
+                'name': real_names.get(geom, m['name']),
                 'x': m['x'], 'y': m['y'],
                 'w': m['width'], 'h': m['height'],
                 'primary': m.get('primary', False),
@@ -449,8 +533,11 @@ class MonitorWidget(Gtk.DrawingArea):
                 'border': 0,
             })
 
+        self._sync_ghosts()
+
         # Validate selection
-        names = [m['name'] for m in self._monitors]
+        names = [m['name'] for m in self._monitors] + \
+            [g['name'] for g in self._ghosts]
         if self._selected_output not in names:
             self._selected_output = None
 
@@ -544,17 +631,27 @@ class MonitorWidget(Gtk.DrawingArea):
             if hasattr(output, 'position'):
                 output.active = True
             else:
-                pos = Position((0, 0))
-                for mode in self._xrandr.state.outputs[output_name].modes:
-                    if mode[0] <= virtual_state.max[0] and mode[1] <= virtual_state.max[1]:
-                        first_mode = mode
-                        break
-                else:
+                state_out = self._xrandr.state.outputs[output_name]
+                fitting = [m for m in state_out.modes
+                           if m[0] <= virtual_state.max[0]
+                           and m[1] <= virtual_state.max[1]]
+                if not fitting:
                     raise InadequateConfiguration(
                         "Smallest mode too large for virtual.")
-
+                pref = state_out.preferred_resolution
+                first_mode = next(
+                    (m for m in fitting
+                     if pref and (m[0], m[1]) == tuple(pref)),
+                    fitting[0])
+                # Dock a newly enabled output to the right of the current
+                # layout instead of over it at 0,0, where it hid under
+                # the primary and looked like nothing happened.
+                others = [o for n, o in self._xrandr.configuration.outputs.items()
+                          if o.active and n != output_name]
+                dock_x = max((o.position[0] + o.size[0] for o in others),
+                             default=0)
                 output.active = True
-                output.position = pos
+                output.position = Position((dock_x, 0))
                 output.mode = first_mode
                 output.rotation = NORMAL
 
@@ -690,7 +787,7 @@ class MonitorWidget(Gtk.DrawingArea):
         context.rectangle(0, 0, alloc.width, alloc.height)
         context.fill()
 
-        if not self._monitors:
+        if not self._monitors and not self._ghosts:
             return
 
         context.save()
@@ -705,13 +802,15 @@ class MonitorWidget(Gtk.DrawingArea):
         # badge sizes must therefore be multiplied by self.factor.
         fac = self.factor
 
-        # Virtual-screen bounding box the monitors sit on
-        max_x = max(m['x'] + m['w'] for m in self._monitors)
-        max_y = max(m['y'] + m['h'] for m in self._monitors)
+        # Virtual-screen bounding box the monitors sit on (ghost tiles
+        # sit outside it on purpose: they are not part of the screen)
         colors = self._theme_colors
-        _rounded_rect(context, 0, 0, max_x, max_y, 6 * fac)
-        context.set_source_rgba(*colors['workarea'])
-        context.fill()
+        if self._monitors:
+            max_x = max(m['x'] + m['w'] for m in self._monitors)
+            max_y = max(m['y'] + m['h'] for m in self._monitors)
+            _rounded_rect(context, 0, 0, max_x, max_y, 6 * fac)
+            context.set_source_rgba(*colors['workarea'])
+            context.fill()
 
         # One uniform label font size for the whole pane, scaled to the
         # widget (larger on the big editable pane, smaller on the
@@ -807,53 +906,91 @@ class MonitorWidget(Gtk.DrawingArea):
 
             # Name pill — uniform font, ellipsized to fit the tile so it
             # never spills past the edges into neighbouring tiles.
-            context.save()
-
-            rotation = mon['rotation']
-            is_odd_rotation = rotation and rotation.is_odd
-            along = rect[3] if is_odd_rotation else rect[2]  # text baseline runs here
-            textheight = label_font_px
-
-            newdescr = Pango.FontDescription("sans bold")
-            newdescr.set_absolute_size(textheight * Pango.SCALE)
-
             name_markup = GLib.markup_escape_text(name)
             if mon['primary']:
                 name_markup = "<u>%s</u>" % name_markup
-            layout = PangoCairo.create_layout(context)
-            layout.set_font_description(newdescr)
-            layout.set_markup(name_markup, -1)
+            self._draw_name_pill(context, name_markup, rect, label_font_px,
+                                 mon['rotation'])
 
-            pad_x = textheight * 0.5
-            pad_y = textheight * 0.28
-            # Available text width inside the tile, leaving a margin so
-            # the pill has breathing room from the tile border.
-            max_text_w = max(along - 4 * pad_x, textheight)
-            nat_w, nat_h = layout.get_pixel_size()
-            if nat_w > max_text_w:
-                layout.set_ellipsize(Pango.EllipsizeMode.END)
-                layout.set_width(int(max_text_w * Pango.SCALE))
-                draw_w = max_text_w
-            else:
-                draw_w = nat_w
+        self._draw_ghosts(context, label_font_px)
 
-            # Pill centered on the tile, handling rotation
-            context.translate(*center)
-            if rotation:
-                context.rotate(rotation.angle)
-
-            pill_w = draw_w + 2 * pad_x
-            pill_h = nat_h + 2 * pad_y
-            _rounded_rect(context, -pill_w / 2, -pill_h / 2,
-                          pill_w, pill_h, pill_h / 2)
-            context.set_source_rgba(*colors['pill_bg'])
+    def _draw_ghosts(self, context, label_font_px):
+        """Dashed, dimmed tiles for connected-but-inactive outputs (see
+        _sync_ghosts). Selected ghost gets the accent ring like a real
+        tile, so the user sees what the Active switch will act on."""
+        fac = self.factor
+        colors = self._theme_colors
+        for g in self._ghosts:
+            rect = (g['x'], g['y'], g['w'], g['h'])
+            radius = min(6 * fac, min(rect[2], rect[3]) * 0.1)
+            is_selected = (g['name'] == self._selected_output)
+            _rounded_rect(context, rect[0], rect[1], rect[2], rect[3], radius)
+            context.set_source_rgba(*(tuple(colors['bg'][:3]) + (0.35,)))
             context.fill()
+            _rounded_rect(context, rect[0], rect[1], rect[2], rect[3], radius)
+            if is_selected:
+                context.set_source_rgba(*colors['accent'])
+                context.set_line_width((1 if self._readonly else 2) * fac)
+            else:
+                context.set_source_rgba(*colors['border'])
+                context.set_line_width(1 * fac)
+            context.set_dash([6 * fac, 4 * fac])
+            context.stroke()
+            context.set_dash([])
+            self._draw_name_pill(
+                context,
+                "%s <span alpha='70%%'>%s</span>" % (
+                    GLib.markup_escape_text(g['name']), _("off")),
+                rect, label_font_px * 0.85, None)
 
-            context.move_to(-draw_w / 2, -nat_h / 2)
-            context.set_source_rgba(*colors['pill_fg'])
-            PangoCairo.show_layout(context, layout)
+    def _draw_name_pill(self, context, name_markup, rect, textheight,
+                        rotation):
+        """Centered label pill for a tile, ellipsized to the tile width
+        (or height when rotated by an odd quarter turn)."""
+        colors = self._theme_colors
+        center = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+        context.save()
 
-            context.restore()
+        is_odd_rotation = rotation and rotation.is_odd
+        along = rect[3] if is_odd_rotation else rect[2]  # text baseline runs here
+
+        newdescr = Pango.FontDescription("sans bold")
+        newdescr.set_absolute_size(textheight * Pango.SCALE)
+
+        layout = PangoCairo.create_layout(context)
+        layout.set_font_description(newdescr)
+        layout.set_markup(name_markup, -1)
+
+        pad_x = textheight * 0.5
+        pad_y = textheight * 0.28
+        # Available text width inside the tile, leaving a margin so
+        # the pill has breathing room from the tile border.
+        max_text_w = max(along - 4 * pad_x, textheight)
+        nat_w, nat_h = layout.get_pixel_size()
+        if nat_w > max_text_w:
+            layout.set_ellipsize(Pango.EllipsizeMode.END)
+            layout.set_width(int(max_text_w * Pango.SCALE))
+            draw_w = max_text_w
+        else:
+            draw_w = nat_w
+
+        # Pill centered on the tile, handling rotation
+        context.translate(*center)
+        if rotation:
+            context.rotate(rotation.angle)
+
+        pill_w = draw_w + 2 * pad_x
+        pill_h = nat_h + 2 * pad_y
+        _rounded_rect(context, -pill_w / 2, -pill_h / 2,
+                      pill_w, pill_h, pill_h / 2)
+        context.set_source_rgba(*colors['pill_bg'])
+        context.fill()
+
+        context.move_to(-draw_w / 2, -nat_h / 2)
+        context.set_source_rgba(*colors['pill_fg'])
+        PangoCairo.show_layout(context, layout)
+
+        context.restore()
 
     def _draw_split_overlay(self, context, tree, x, y, w, h, border=0,
                             selected_leaf_idx=None):
@@ -948,7 +1085,10 @@ class MonitorWidget(Gtk.DrawingArea):
             self.selected_output = virtual if virtual else which
             self._force_repaint()
         elif event.button == 1 and not undermouse:
-            self.selected_output = None
+            # Nothing active under the pointer: maybe a ghost tile
+            # (connected-but-off output) -- select it so the detail
+            # panel's Active switch can turn it on.
+            self.selected_output = self._ghost_at(event.x, event.y)
         if event.button == 3:
             if undermouse:
                 target = [m['name'] for m in self._monitors
@@ -962,7 +1102,8 @@ class MonitorWidget(Gtk.DrawingArea):
                 menu = self._contextmenu(target)
                 menu.popup(None, None, None, None, event.button, event.time)
             else:
-                menu = self.contextmenu()
+                ghost = self._ghost_at(event.x, event.y)
+                menu = self._contextmenu(ghost) if ghost else self.contextmenu()
                 menu.popup(None, None, None, None, event.button, event.time)
 
         self._lastclick = (event.x, event.y)
