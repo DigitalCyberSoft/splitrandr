@@ -173,6 +173,26 @@ class XRandRSaveMixin:
             self._log_tree("left", tree.left, indent + "  ")
             self._log_tree("right", tree.right, indent + "  ")
 
+    def _monitors_xml_changed(self):
+        """True when the shell's stored config for our monitor set differs
+        from what this apply wrote, i.e. the running shell must restart to
+        load it. Compares monitors_xml_semantics of the file as it was
+        before this apply (captured at the top of save_to_x) with the file
+        now."""
+        from .fakexrandr_config import monitors_xml_semantics
+        written = monitors_xml_semantics(compositor.current().monitors_xml_path)
+        if not written:
+            return False
+        before = getattr(self, '_pre_apply_xml_semantics', None) or {}
+        for key, cfg in written.items():
+            if before.get(key) != cfg:
+                log.info("monitors.xml entry for this monitor set %s -- the "
+                         "shell only reads it at startup",
+                         "was absent" if key not in before
+                         else "changed (e.g. a disabled output)")
+                return True
+        return False
+
     def save_to_x(self, reason=''):
         """Apply the configuration to the X server.
 
@@ -205,6 +225,25 @@ class XRandRSaveMixin:
                 self._pre_apply_bin_hash = hashlib.sha1(_f.read()).hexdigest()
         except (FileNotFoundError, OSError):
             self._pre_apply_bin_hash = ''
+
+        # Same idea for the shell's monitors.xml, compared SEMANTICALLY
+        # (monitors_xml_semantics). muffin reads that file ONLY at startup
+        # (no file monitor in meta-monitor-config-store.c), and every
+        # config it applies persistently REPLACES the same-key entry in
+        # its in-memory store and re-saves the file. So an xml we write
+        # that the running shell never loads is inert, and a single linear
+        # fallback (lid event, HDMI link blink, a Display Settings click)
+        # poisons the store with the internal panel enabled until the
+        # shell restarts. Observed on lounge 2026-09-03: eDP disabled in
+        # the profile and in our xml, yet muffin silently re-applied a
+        # 5760-wide linear layout with eDP at 1920,0 (no "Failed to use
+        # stored" warning -- the stored entry WAS the poisoned one) and
+        # overwrote our file a minute after each apply. The restart gate
+        # below reloads the store when our entry differs from what was
+        # on disk before this apply.
+        from .fakexrandr_config import monitors_xml_semantics
+        self._pre_apply_xml_semantics = monitors_xml_semantics(
+            compositor.current().monitors_xml_path)
 
         # Disable csd-xrandr and freeze Cinnamon BEFORE any xrandr changes.
         # If we run the main xrandr command first, CSD-xrandr reacts to the
@@ -410,19 +449,29 @@ class XRandRSaveMixin:
 
             so_stale = has_splits and not is_cinnamon_fakexrandr_current()
 
-            if has_splits and (so_stale or bin_changed):
+            # The shell's stored monitor config only reloads at startup;
+            # see the capture comment near the top of save_to_x.
+            xml_changed = self._monitors_xml_changed()
+
+            if has_splits and (so_stale or bin_changed or xml_changed):
                 lib_path = _find_fakexrandr_lib()
                 if lib_path:
                     log.info("restarting Cinnamon to refresh MetaMonitor list "
-                             "(so_stale=%s bin_changed=%s)", so_stale, bin_changed)
-                    restart_cinnamon_with_fakexrandr(lib_path)
-                    from .cinnamon_compat import _wait_cinnamon_on_dbus
-                    if not _wait_cinnamon_on_dbus(timeout=15.0):
-                        log.warning("Cinnamon did not respond on D-Bus within timeout")
-                    log.info("Cinnamon restarted with LD_PRELOAD")
-            elif not has_splits and is_cinnamon_fakexrandr_loaded():
-                log.info("no splits active, restarting Cinnamon without fakexrandr")
-                restart_cinnamon_without_fakexrandr()
+                             "(so_stale=%s bin_changed=%s xml_changed=%s)",
+                             so_stale, bin_changed, xml_changed)
+                    from .shell_recovery import restart_shell_shielded
+                    if restart_shell_shielded(
+                            lambda: restart_cinnamon_with_fakexrandr(lib_path)):
+                        log.info("Cinnamon restarted with LD_PRELOAD")
+                    else:
+                        log.warning("Cinnamon restart did not reach a healthy "
+                                    "shell; see the recovery log lines above")
+            elif not has_splits and (is_cinnamon_fakexrandr_loaded()
+                                     or xml_changed):
+                log.info("no splits active, restarting Cinnamon without "
+                         "fakexrandr (xml_changed=%s)", xml_changed)
+                from .shell_recovery import restart_shell_shielded
+                restart_shell_shielded(restart_cinnamon_without_fakexrandr)
 
             # Keep the session-wide preload in sync with split state, so
             # apps NOT launched from the preloaded Cinnamon lineage

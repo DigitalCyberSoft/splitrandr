@@ -343,6 +343,11 @@ def _wait_shell_healthy(timeout=60.0):
     logical monitor list. D-Bus presence is NOT it -- the old wedged shell
     answers Eval right up until it yields (that false signal is how the
     previous recovery logged success in 5ms while doing nothing)."""
+    from . import compositor
+    if not compositor.current().supports_eval:
+        # No Eval (GNOME): D-Bus readiness is the best signal available.
+        from .cinnamon_compat import _wait_cinnamon_on_dbus
+        return _wait_cinnamon_on_dbus(timeout=timeout)
     from .cinnamon_compat import cinnamon_shell_health
     deadline = time.time() + timeout
     health = None
@@ -369,9 +374,7 @@ def _wait_shell_healthy(timeout=60.0):
     return False
 
 
-def _restart_shell_cycle():
-    """One spawn + standoff resolution + health wait. Returns True when the
-    shell reports monitors > 0."""
+def _default_restart():
     from .fakexrandr_config import (
         _find_fakexrandr_lib, restart_cinnamon_with_fakexrandr,
     )
@@ -380,8 +383,15 @@ def _restart_shell_cycle():
         log.error("fakexrandr library not found; cannot restart the shell "
                   "with the shim")
         return False
+    return restart_cinnamon_with_fakexrandr(lib_path)
+
+
+def _restart_shell_cycle(restart_fn=None):
+    """One spawn + standoff resolution + health wait. Returns True when the
+    shell reports monitors > 0. ``restart_fn`` performs the spawn (default:
+    with the fakexrandr shim)."""
     old_pids = _pidof('cinnamon')
-    if not restart_cinnamon_with_fakexrandr(lib_path):
+    if not (restart_fn or _default_restart)():
         return False
     new_pid = _wait_new_shell_pid(old_pids)
     if new_pid is None:
@@ -391,6 +401,20 @@ def _restart_shell_cycle():
     if old_pids:
         _resolve_standoff(old_pids, new_pid)
     return _wait_shell_healthy()
+
+
+def restart_shell_shielded(restart_fn):
+    """A PLANNED shell restart (split topology or monitors.xml changed) with
+    the same protections as recovery: SIGSTOP shield on gnome-terminal-server
+    (and the GUI, unless we are it), standoff resolution, and a real health
+    wait instead of polling a bus name the old shell still answers. Returns
+    True when the new shell reports monitors > 0."""
+    shield = _Shield()
+    shield.stop()
+    try:
+        return _restart_shell_cycle(restart_fn)
+    finally:
+        shield.cont()
 
 
 def _apply_layout():

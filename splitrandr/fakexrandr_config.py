@@ -931,6 +931,90 @@ def write_cinnamon_monitors_xml(splits_dict, xrandr_state, xrandr_config, border
              xml_path, count, disabled_count)
 
 
+def _f32(x):
+    """Round to the nearest float32 -- the precision muffin keeps refresh
+    rates at (MetaMonitorModeSpec.refresh_rate is a C float)."""
+    return struct.unpack('f', struct.pack('f', float(x)))[0]
+
+
+def _xml_text(parent, tag, default=''):
+    el = parent.find(tag) if parent is not None else None
+    return (el.text or '').strip() if el is not None else default
+
+
+def _spec_tuple(monitorspec):
+    return (_xml_text(monitorspec, 'connector'), _xml_text(monitorspec, 'vendor'),
+            _xml_text(monitorspec, 'product'), _xml_text(monitorspec, 'serial'))
+
+
+def _monitors_xml_semantics(root):
+    """Canonical, order-independent view of every <configuration> in a
+    monitors.xml tree, as ``{key: config}``.
+
+    ``key`` is the sorted tuple of monitor specs across enabled AND
+    disabled monitors -- muffin's MetaMonitorsConfigKey (config-manager.c
+    meta_monitors_config_key_new sorts the same way). ``config`` is
+    (sorted logical monitors, sorted disabled specs), each logical monitor
+    being (x, y, scale, primary, rotation, sorted monitors with mode),
+    rates rounded to float32 then 1e-3.
+
+    Semantic rather than byte comparison because muffin re-serializes the
+    file whenever it saves: its rate for the same mode prints as
+    59.968498229980469 where we print 59.96849684968497 (identical as
+    float32), and it orders logical monitors differently. A byte compare
+    would call every apply a change and restart the shell every time.
+    """
+    configs = {}
+    for conf in root.findall('configuration'):
+        logical = []
+        specs = []
+        for lm in conf.findall('logicalmonitor'):
+            def _num(tag, default):
+                txt = _xml_text(lm, tag)
+                try:
+                    return round(float(txt), 3) if txt else default
+                except ValueError:
+                    return default
+            primary = _xml_text(lm, 'primary') == 'yes'
+            rotation = _xml_text(lm.find('transform'), 'rotation', 'normal') \
+                if lm.find('transform') is not None else 'normal'
+            mons = []
+            for mon in lm.findall('monitor'):
+                spec = _spec_tuple(mon.find('monitorspec'))
+                mode = mon.find('mode')
+                try:
+                    w = int(_xml_text(mode, 'width') or 0)
+                    h = int(_xml_text(mode, 'height') or 0)
+                    rate = round(_f32(_xml_text(mode, 'rate') or 0.0), 3)
+                except ValueError:
+                    w, h, rate = 0, 0, 0.0
+                mons.append(spec + (w, h, rate))
+                specs.append(spec)
+            logical.append((_num('x', 0), _num('y', 0), _num('scale', 1),
+                            primary, rotation, tuple(sorted(mons))))
+        disabled = []
+        for dis in conf.findall('disabled'):
+            for ms in dis.findall('monitorspec'):
+                spec = _spec_tuple(ms)
+                disabled.append(spec)
+                specs.append(spec)
+        configs[tuple(sorted(specs))] = (tuple(sorted(logical)),
+                                         tuple(sorted(disabled)))
+    return configs
+
+
+def monitors_xml_semantics(path):
+    """``{key: config}`` for the monitors.xml at ``path`` (see
+    _monitors_xml_semantics), or None when the file is missing or does not
+    parse. Used to decide whether the running shell must be restarted to
+    load what we wrote: the shell reads this file only at startup."""
+    try:
+        tree = ET.parse(path)
+    except (OSError, ET.ParseError):
+        return None
+    return _monitors_xml_semantics(tree.getroot())
+
+
 def _add_logicalmonitor(parent, connector, vendor, product, serial,
                         x, y, width, height, rate, primary=False, scale=1):
     """Add a <logicalmonitor> element to a <configuration>."""
