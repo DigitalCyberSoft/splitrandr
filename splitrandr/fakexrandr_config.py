@@ -9,6 +9,7 @@
 
 import os
 import re
+import shutil
 import struct
 import subprocess
 import logging
@@ -395,6 +396,33 @@ _CS_PAM_HELPER_EXEC = \
 _CS_MAIN_EXEC = '/usr/share/cinnamon-screensaver/cinnamon-screensaver-main.py'
 
 
+def is_screensaver_daemon(pid, argv):
+    """True when (pid, argv) is the cinnamon-screensaver daemon.
+
+    The daemon has TWO cmdline forms. It starts as
+    ``python3 /usr/share/cinnamon-screensaver/cinnamon-screensaver-main.py
+    [--debug]`` and then sets its process title, after which
+    /proc/<pid>/cmdline reads just ``cinnamon-screensaver``. Matching only
+    the first form (argv[1] == main.py) misses a running, locked daemon --
+    found 2026-11-06 when the supervised lock test saw "no daemon" for the
+    whole 10 s lock window. The title form is accepted only when the
+    executable really is a Python interpreter, so the pam-helper (same
+    truncated comm, "cinnamon-screen") or a shell can't match.
+    """
+    argv = [a for a in (argv or []) if a]
+    if not argv:
+        return False
+    if len(argv) >= 2 and argv[1] == _CS_MAIN_EXEC:
+        return True
+    if argv == ['cinnamon-screensaver']:
+        try:
+            exe = os.path.basename(os.readlink('/proc/%d/exe' % pid))
+        except OSError:
+            return False
+        return exe.startswith('python')
+    return False
+
+
 def reap_orphaned_lock_helpers():
     """SIGTERM cs-backup-locker / pam-helper processes whose daemon is gone.
 
@@ -468,18 +496,15 @@ def _activate_screensaver_override():
                  active)
         return
 
-    # Drop the running daemon so it re-activates with the preload. Match the
-    # interpreter running cinnamon-screensaver-main.py on argv[1]: the sh
-    # wrapper exec's main.py, so the live cmdline is
-    # "python3 /usr/share/cinnamon-screensaver/cinnamon-screensaver-main.py
-    # [--debug]". The pkill pattern this replaced ('/cinnamon-screensaver$')
-    # never matched that cmdline at all. argv[1] equality leaves
+    # Drop the running daemon so it re-activates with the preload. See
+    # is_screensaver_daemon for the two cmdline forms; it leaves
     # csd-screensaver-proxy, the lock helpers, and any shell merely
-    # mentioning the path alone.
+    # mentioning the path alone. (The pkill pattern this replaced,
+    # '/cinnamon-screensaver$', never matched either form.)
     import psutil
     for proc in psutil.process_iter(['pid', 'cmdline']):
-        argv = proc.info.get('cmdline') or []
-        if len(argv) < 2 or argv[1] != _CS_MAIN_EXEC:
+        if not is_screensaver_daemon(proc.info['pid'],
+                                     proc.info.get('cmdline')):
             continue
         try:
             os.kill(proc.info['pid'], 15)
@@ -1321,6 +1346,124 @@ def _truncate_oversized_log(path, max_bytes=FAKEXRANDR_LOG_MAX_BYTES):
              path, size / 1048576.0, max_bytes / 1048576.0)
 
 
+def _own_cgroup_leaf():
+    """Leaf of this process's cgroup v2 path, e.g. 'session-3.scope' or
+    'splitrandr-sentinel.service'."""
+    try:
+        with open('/proc/self/cgroup') as f:
+            path = f.read().strip().rsplit(':', 1)[-1]
+    except OSError:
+        return ''
+    return path.rstrip('/').rsplit('/', 1)[-1]
+
+
+# Never filled in from the session environment: the caller decides the
+# preload state of the new shell (with- or without-shim restart).
+_SESSION_ENV_NEVER_FILL = ('LD_PRELOAD', 'FAKEXRANDR_LOG',
+                           'SPLITRANDR_IN_RECOVERY', 'SPLITRANDR_AUTO_RECOVERY')
+
+
+def _session_environ():
+    """The graphical session's environment, read from the session manager
+    (cinnamon-session-binary on Fedora; it survives shell crashes)."""
+    for name in ('cinnamon-session-binary', 'cinnamon-session',
+                 'gnome-session-binary'):
+        try:
+            out = subprocess.run(['pidof', name], capture_output=True,
+                                 text=True, timeout=5)
+            pids = [int(x) for x in out.stdout.split()]
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+        for pid in pids:
+            try:
+                with open('/proc/%d/environ' % pid, 'rb') as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            env = {}
+            for kv in raw.split(b'\0'):
+                if b'=' in kv:
+                    k, v = kv.split(b'=', 1)
+                    env[k.decode('utf-8', 'replace')] = v.decode(
+                        'utf-8', 'replace')
+            if env:
+                return env
+    return {}
+
+
+def _spawn_shell(argv, env, stdout, stderr):
+    """Start the (replacement) shell so that it OUTLIVES the caller.
+
+    A process started from inside a systemd ``.service`` cgroup stays in
+    that cgroup, and when the unit finishes systemd kills everything left
+    in it. The recovery sentinel is a oneshot service, so on 2026-11-04 it
+    restored the shell five times in four minutes and systemd killed each
+    new cinnamon the instant the sentinel run finished (unit "Finished" and
+    the nemo-desktop SEGV share the same second, 4 of 4). Launching via
+    ``systemd-run --user --scope`` gives the shell its own scope, which the
+    unit's exit does not touch. gnome-terminal-server is a .service too.
+
+    The same contexts also carry a degraded environment (the systemd user
+    manager has no XDG_SESSION_ID, XDG_SEAT, XDG_SESSION_TYPE, LANG,
+    GDMSESSION), and every app launched from the shell inherits it, so the
+    missing keys are filled in from the session manager's environment.
+    Callers that already run in the session scope (the GUI, a recovery the
+    GUI or the shell spawned) are unchanged.
+    """
+    leaf = _own_cgroup_leaf()
+    if leaf.endswith('.service'):
+        filled = []
+        for k, v in _session_environ().items():
+            if k not in env and k not in _SESSION_ENV_NEVER_FILL:
+                env[k] = v
+                filled.append(k)
+        if filled:
+            notable = [k for k in ('XDG_SESSION_ID', 'XDG_SEAT',
+                                   'XDG_SESSION_TYPE', 'LANG', 'GDMSESSION')
+                       if k in filled]
+            log.info("filled %d session env var(s) missing from %s "
+                     "(including %s)", len(filled), leaf,
+                     ', '.join(notable) or 'none of the session-identity ones')
+        if not shutil.which('systemd-run'):
+            log.warning("caller is in %s and systemd-run is unavailable: the "
+                        "new shell will be killed when that unit stops", leaf)
+            return subprocess.Popen(argv, env=env, start_new_session=True,
+                                    stdout=stdout, stderr=stderr)
+        log.info("caller is in %s; launching the shell in its own systemd "
+                 "scope so the unit's exit cannot kill it", leaf)
+        proc = subprocess.Popen(
+            ['systemd-run', '--user', '--scope', '--collect', '--quiet',
+             '--description=Cinnamon restarted by SplitRandR', '--']
+            + list(argv),
+            env=env, start_new_session=True, stdout=stdout, stderr=stderr)
+        # systemd-run moves ITSELF into the new scope (a D-Bus round-trip)
+        # and only then execs the shell. Until that completes the process
+        # is still in our unit's cgroup and dies with it -- a caller that
+        # exits right after spawning would lose the race. Wait for the move.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with open('/proc/%d/cgroup' % proc.pid) as f:
+                    child_leaf = f.read().strip().rstrip('/').rsplit('/', 1)[-1]
+            except OSError:
+                log.warning("shell launcher exited before leaving %s", leaf)
+                break
+            if child_leaf != leaf:
+                log.info("new shell is in its own scope (%s)", child_leaf)
+                break
+            if proc.poll() is not None:
+                log.warning("systemd-run exited (%s) before the shell left "
+                            "%s", proc.returncode, leaf)
+                break
+            time.sleep(0.05)
+        else:
+            log.warning("new shell still in %s after 10s; it may be killed "
+                        "when that unit stops", leaf)
+        return proc
+    return subprocess.Popen(argv, env=env, start_new_session=True,
+                            stdout=stdout, stderr=stderr)
+
+
 def restart_cinnamon_with_fakexrandr(lib_path=None):
     """Restart the shell (Cinnamon/GNOME) with fakexrandr LD_PRELOAD.
 
@@ -1386,11 +1529,7 @@ def restart_cinnamon_with_fakexrandr(lib_path=None):
 
     log.info("restarting %s with LD_PRELOAD=%s FAKEXRANDR_LOG=%s",
              comp.shell_process, env['LD_PRELOAD'], env['FAKEXRANDR_LOG'])
-    subprocess.Popen(
-        comp.restart_argv, env=env,
-        start_new_session=True,
-        stdout=cinnamon_log, stderr=cinnamon_log,
-    )
+    _spawn_shell(comp.restart_argv, env, cinnamon_log, cinnamon_log)
     return True
 
 
@@ -1412,11 +1551,8 @@ def restart_cinnamon_without_fakexrandr():
     _reap_children()
 
     log.info("restarting %s without fakexrandr", compositor.current().shell_process)
-    subprocess.Popen(
-        compositor.current().restart_argv, env=env,
-        start_new_session=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    _spawn_shell(compositor.current().restart_argv, env,
+                 subprocess.DEVNULL, subprocess.DEVNULL)
     return True
 
 

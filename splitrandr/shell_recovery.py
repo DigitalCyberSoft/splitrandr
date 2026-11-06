@@ -19,10 +19,12 @@ The sequence implemented here is the manually validated one that
 recovered five consecutive incidents (2026-08-05/-06/-09/-12/-14),
 including its hard-won variants:
 
-  (a) lock-trap: screensaver active while the shell is wedged means the
-      unlock UI can never render; deactivate CLEANLY over D-Bus first.
-      Never kill cs-backup-locker -- that orphans pam-helpers and causes
-      the 2026-07-25 style lockout.
+  (a) lock-trap: the password prompt is invisible while the shell is
+      wedged, but the screensaver keeps working, so the lock is KEPT
+      across the restart and the restarted shell shows the prompt. Only a
+      backup locker with a dead daemon (no prompt anywhere) is deactivated,
+      cleanly over D-Bus. Never kill cs-backup-locker -- that orphans
+      pam-helpers and causes the 2026-07-25 style lockout.
   (b) orphaned XI2 input grab: after recovery the shell can hold
       pointer+keyboard grabs with no modal to justify them; nothing
       in-process releases them, only another shell restart does.
@@ -117,6 +119,21 @@ def _save_state(state):
         log.warning("could not save recovery state: %s", e)
 
 
+def _update_state(**updates):
+    """Read-modify-write a subset of the persisted state.
+
+    The sentinel used to load the whole dict, call recover() (which writes
+    last_recovery_start), then save its stale copy at the end -- silently
+    erasing the timestamp, so the auto-recovery cooldown never engaged. On
+    2026-11-04 that let five back-to-back recoveries run in four minutes.
+    Every writer must merge into the file as it is NOW.
+    """
+    state = _load_state()
+    state.update(updates)
+    _save_state(state)
+    return state
+
+
 def _pidof(name):
     """Exact-program-name pid lookup. pidof matches the running program's
     name, unlike pgrep whose comm matching truncates at 15 chars and whose
@@ -208,9 +225,9 @@ def _screensaver_active():
 
 
 def _deactivate_screensaver():
-    """Variant (a) lock-trap: with the shell wedged the unlock UI can never
-    render, so a locked screen is a lockout. Deactivate cleanly over D-Bus
-    -- the locker exits on its own. NEVER kill cs-backup-locker or the
+    """Deactivate a lock no prompt can answer (see
+    _handle_lock_before_restart -- the ONLY caller). Cleanly over D-Bus:
+    the locker exits on its own. NEVER kill cs-backup-locker or the
     pam-helper directly."""
     log.warning("screensaver is active while the shell is wedged (lock-trap)"
                 " -- deactivating cleanly via SetActive(false)")
@@ -224,6 +241,75 @@ def _deactivate_screensaver():
     log.warning("screensaver still active after SetActive(false); "
                 "continuing anyway (it may release once the shell is back)")
     return False
+
+
+def _pids_where_argv(match):
+    """PIDs whose (pid, argv) satisfies ``match`` -- read from /proc, NOT
+    D-Bus: asking org.cinnamon.ScreenSaver anything D-Bus-activates a
+    fresh, unlocked daemon when none is running."""
+    pids = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            with open('/proc/%s/cmdline' % entry, 'rb') as f:
+                raw = f.read()
+        except OSError:
+            continue
+        argv = [a.decode('utf-8', 'replace') for a in raw.split(b'\0') if a]
+        if argv and match(int(entry), argv):
+            pids.append(int(entry))
+    return pids
+
+
+def _screensaver_daemon_pids():
+    from .fakexrandr_config import is_screensaver_daemon
+    return _pids_where_argv(is_screensaver_daemon)
+
+
+def _backup_locker_pids():
+    from .fakexrandr_config import _CS_LOCKER_EXEC
+    return _pids_where_argv(lambda pid, a: a[0] == _CS_LOCKER_EXEC)
+
+
+def _handle_lock_before_restart(health):
+    """Decide whether a lock survives the shell restart. Default: it does.
+
+    The password prompt is invisible during a wedge only because the
+    wedged shell composites nothing; the screensaver daemon itself keeps
+    working (2026-08-09 00:54:58 and 2026-11-04 12:35:54 both show its
+    pam-helper prompting "Password:"). The restarted shell composites the
+    prompt again, so the lock is kept and the user's password unlocks it.
+    The old behavior -- SetActive(false) on every confirmed wedge -- became
+    a password-free unlock on every KVM switch-back (2026-11-04).
+
+    The one exception is a lock no prompt can ever answer: cs-backup-locker
+    holding the screen with the daemon dead. Then deactivate cleanly, and
+    only on a CONFIRMED zero-monitor wedge (health None can be a merely
+    slow shell). Never kill the backup locker or pam-helper directly: that
+    orphans pam-helpers (the 2026-07-25 lockout).
+    """
+    daemon = _screensaver_daemon_pids()
+    locker = _backup_locker_pids()
+    confirmed = bool(health and health.get('monitors', -1) == 0)
+    if daemon:
+        if _screensaver_active():
+            log.warning("screen is locked and the screensaver daemon is alive "
+                        "(pid %s): KEEPING the lock across the shell restart; "
+                        "the restarted shell shows its password prompt",
+                        daemon)
+        return
+    if not locker:
+        return
+    if confirmed:
+        log.warning("cs-backup-locker (pid %s) holds the screen but the "
+                    "screensaver daemon is dead -- no password prompt can "
+                    "render anywhere; deactivating cleanly", locker)
+        _deactivate_screensaver()
+    else:
+        log.warning("cs-backup-locker (pid %s) holds the screen with no "
+                    "screensaver daemon, but the wedge is unconfirmed "
+                    "(health=%s); leaving it in place", locker, health)
 
 
 def _gui_pid():
@@ -639,8 +725,11 @@ def _recover_locked(auto, reason):
 
     health = cinnamon_shell_health()
     cinnamon_pids = _pidof('cinnamon')
+    from .fakexrandr_config import _own_cgroup_leaf
     log.info("=== shell recovery starting (auto=%s, reason: %s) === "
-             "health=%s cinnamon=%s", auto, reason, health, cinnamon_pids)
+             "health=%s cinnamon=%s cgroup=%s XDG_SESSION_ID=%s", auto, reason,
+             health, cinnamon_pids, _own_cgroup_leaf(),
+             os.environ.get('XDG_SESSION_ID', '-'))
 
     if health and health.get('monitors', 0) > 0:
         log.info("shell reports %d monitor(s) -- healthy, nothing to "
@@ -665,26 +754,12 @@ def _recover_locked(auto, reason):
                         "refusing to restart the shell again so soon",
                         time.time() - last, AUTO_COOLDOWN_SECS)
             return 'cooldown'
-    state['last_recovery_start'] = time.time()
-    _save_state(state)
+    _update_state(last_recovery_start=time.time())
 
     log.warning("shell is wedged (health=%s, %d output(s) connected) -- "
                 "running the validated recovery sequence", health, connected)
 
-    # Variant (a): free a trapped lock before touching the WM -- but only
-    # on a CONFIRMED zero-monitor wedge. That is the state where the
-    # compositor composites black over everything and the unlock UI can
-    # never render. When health is merely None (shell hung or gone), the
-    # lock stays: cinnamon-screensaver is its own process, and once the
-    # shell is restarted its unlock UI renders again. Deactivating on an
-    # unconfirmed wedge would unlock an unattended machine on a false
-    # positive (e.g. Eval timing out under memory pressure).
-    if (health and health.get('monitors', -1) == 0
-            and _screensaver_active()):
-        _deactivate_screensaver()
-    elif _screensaver_active():
-        log.info("screensaver is active and the wedge is unconfirmed "
-                 "(health=%s); leaving the lock in place", health)
+    _handle_lock_before_restart(health)
 
     shield = _Shield()
     shield.stop()
@@ -726,11 +801,55 @@ def _recover_locked(auto, reason):
     return 'recovered' if healthy else 'restart-ran-shell-still-unhealthy'
 
 
+def _recovery_command():
+    """Shell command line that runs --recover-shell as an automatic
+    (cooldown-respecting) recovery, from this checkout or install."""
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parts = ['env', 'SPLITRANDR_AUTO_RECOVERY=1']
+    if 'site-packages' not in pkg_parent and 'dist-packages' not in pkg_parent:
+        parts.append('PYTHONPATH=%s' % pkg_parent)
+    parts += [sys.executable, '-m', 'splitrandr', '--recover-shell']
+    return ' '.join(parts)
+
+
+def _hand_off_recovery_to_shell(why):
+    """Have the (wedged but still answering) shell spawn the recovery.
+
+    A process spawned by the shell lives in the graphical session's scope
+    with the full session environment -- the same place the GUI-driven
+    restart that survived on 2026-11-04 ran from. A recovery run inside
+    the sentinel's own oneshot unit is the configuration that got every
+    new shell killed when the unit finished. Returns True when the shell
+    accepted the spawn.
+    """
+    from .cinnamon_compat import _cinnamon_eval
+    cmd = _recovery_command()
+    result = _cinnamon_eval('Util.spawnCommandLine(%s)' % json.dumps(cmd))
+    if result is None:
+        log.warning("sentinel: shell refused the recovery spawn (%s)", why)
+        return False
+    log.warning("sentinel: %s -- handed recovery to a session-scoped "
+                "process spawned by the shell: %s", why, cmd)
+    return True
+
+
+def _note_outputs_returned():
+    since = _load_state().get('outputs_absent_since')
+    if since:
+        _update_state(outputs_absent_since=None)
+        log.info("sentinel: outputs are back after %.0f min away",
+                 (time.time() - since) / 60.0)
+
+
 def sentinel():
     """Periodic health check, run by a systemd --user timer. Catches the
     case the 2026-08-09/-12 incidents proved: the watcher itself can be
     dead (it is a GTK process; WM swaps can kill it), leaving nobody to
-    detect the wedge. Also resurrects the watcher when it is missing."""
+    detect the wedge. Also resurrects the watcher when it is missing.
+
+    This runs as a oneshot SERVICE: anything it starts that should outlive
+    the run must leave the unit's cgroup (see _hand_off_recovery_to_shell
+    and fakexrandr_config._spawn_shell)."""
     adopt_session_env()
     if not (os.environ.get('DISPLAY')
             and os.environ.get('DBUS_SESSION_BUS_ADDRESS')):
@@ -738,7 +857,6 @@ def sentinel():
         return
 
     from .cinnamon_compat import cinnamon_shell_health
-    state = _load_state()
     cinnamon_pids = _pidof('cinnamon')
     session_alive = bool(_pidof('cinnamon-session-binary')
                          or _pidof('cinnamon-session'))
@@ -747,14 +865,14 @@ def sentinel():
     wedged = False
     why = ''
     if cinnamon_pids and health is not None:
-        state['consecutive_health_none'] = 0
+        _update_state(consecutive_health_none=0)
         if health.get('monitors', 0) == 0:
             wedged, why = True, 'shell reports zero logical monitors'
     elif cinnamon_pids:
         # One None can be transient bus load; two sentinel ticks in a row
         # (>= a minute) with the shell unresponsive is a real problem.
-        misses = state.get('consecutive_health_none', 0) + 1
-        state['consecutive_health_none'] = misses
+        misses = _load_state().get('consecutive_health_none', 0) + 1
+        _update_state(consecutive_health_none=misses)
         if misses >= 2:
             wedged = True
             why = ('shell unresponsive on D-Bus for %d consecutive checks'
@@ -762,24 +880,50 @@ def sentinel():
     elif session_alive:
         wedged, why = True, 'cinnamon process is gone but the session is up'
 
+    if not wedged:
+        _note_outputs_returned()
     if wedged:
-        log.warning("sentinel: %s -- invoking recovery", why)
+        # A KVM switched to another machine (or monitors powered off)
+        # leaves the shell at zero monitors for as long as it lasts; that
+        # is not fixable until the outputs return. Stay quiet instead of
+        # launching a no-op recovery every minute.
+        if _connected_outputs() == 0:
+            # Log the transition only: a KVM switched away for a day used
+            # to produce one line per tick (1,514 lines, Nov 4-6).
+            if not _load_state().get('outputs_absent_since'):
+                _update_state(outputs_absent_since=time.time())
+                log.info("sentinel: %s, but no outputs are connected (KVM "
+                         "switched away / monitors off) -- waiting quietly "
+                         "until they return", why)
+            return
+        _note_outputs_returned()
+        last = _load_state().get('last_recovery_start', 0)
+        if time.time() - last < AUTO_COOLDOWN_SECS:
+            log.warning("sentinel: %s, but an automatic recovery started "
+                        "%.0fs ago (cooldown %ds) -- not restarting the "
+                        "shell again", why, time.time() - last,
+                        AUTO_COOLDOWN_SECS)
+            return
+        if health is not None and _hand_off_recovery_to_shell(why):
+            return
+        # The shell is gone or not answering: recover in-process. The
+        # restart itself escapes this unit's cgroup (_spawn_shell), so the
+        # new shell survives the unit finishing.
+        log.warning("sentinel: %s -- invoking recovery in-process", why)
         verdict = recover(auto=True, reason='sentinel: ' + why)
         log.warning("sentinel: recovery verdict: %s", verdict)
         if verdict in ('recovered', 'healthy'):
-            state['consecutive_health_none'] = 0
+            _update_state(consecutive_health_none=0)
     elif health and health.get('monitors', 0) > 0 and not _gui_pid():
-        last = state.get('last_gui_relaunch', 0)
+        last = _load_state().get('last_gui_relaunch', 0)
         if time.time() - last >= 120:
             log.warning("sentinel: shell is healthy but no splitrandr "
                         "watcher is running -- relaunching it")
             if relaunch_watcher_gui():
-                state['last_gui_relaunch'] = time.time()
+                _update_state(last_gui_relaunch=time.time())
         else:
             log.info("sentinel: watcher still missing but it was relaunched "
                      "%.0fs ago; waiting", time.time() - last)
-
-    _save_state(state)
 
 
 _SERVICE_UNIT = """\
